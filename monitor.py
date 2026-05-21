@@ -36,7 +36,8 @@ def send_telegram(text, photo_url=None):
 
 def fetch_items(scraper):
     params = {"search_text": SEARCH_QUERY, "price_to": PRICE_MAX,
-              "order": "newest_first", "per_page": 96}
+              "order": "newest_first", "per_page": 96,
+              "status_ids[]": 1}
     headers = {"Accept": "application/json, text/plain, */*",
                "X-Requested-With": "XMLHttpRequest",
                "Referer": f"{VINTED_BASE_URL}/catalog?search_text={SEARCH_QUERY}"}
