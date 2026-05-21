@@ -1,11 +1,13 @@
 import os, json, requests, cloudscraper, logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
 MAX_SEEN_IDS     = 5000
+# Finestra massima di età per considerare un annuncio "recente" (in ore)
+MAX_ITEM_AGE_HOURS = int(os.environ.get("MAX_ITEM_AGE_HOURS", "24"))
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -30,7 +32,7 @@ BLACKLIST_KEYWORDS = [
     "playstation 4", "playstation 5", "playstation 3", "playstation 2",
     "xbox", "nintendo", "switch", "wii",
     "carta", "carte", "card", "cards",
-    "pokemon", "pok\u00e9mon", "yugioh", "yu-gi-oh", "magic the gathering", "mtg",
+    "pokemon", "pokémon", "yugioh", "yu-gi-oh", "magic the gathering", "mtg",
     "amiibo", "funko",
     "cover", "custodia", "borsa", "zaino", "poster", "tazza",
     "felpa", "maglietta", "t-shirt",
@@ -86,6 +88,52 @@ def is_relevant(item):
             return False
 
     return True
+
+
+def is_recent(item):
+    """Ritorna True solo se l'annuncio è stato creato/aggiornato di recente.
+
+    Usa i timestamp Vinted:
+    - created_at_ts: quando l'annuncio è stato creato
+    - updated_at_ts: ultima modifica
+    - user_updated_at_ts: ultimo aggiornamento fatto dall'utente
+    """
+    ts = (
+        item.get("created_at_ts")
+        or item.get("updated_at_ts")
+        or item.get("user_updated_at_ts")
+    )
+    if not ts:
+        # Se Vinted non manda timestamp, meglio non filtrare per evitare falsi negativi
+        return True
+
+    try:
+        # Normalizza "Z" in "+00:00" per datetime.fromisoformat
+        ts_norm = ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts_norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+
+        age = datetime.now(timezone.utc) - dt
+        if age.total_seconds() < 0:
+            # Data nel futuro? Consideriamolo recente
+            return True
+
+        if age > timedelta(hours=MAX_ITEM_AGE_HOURS):
+            log.info(
+                "  [SKIP troppo vecchio] %s (age=%sd, created_at_ts=%s)",
+                item.get("title"),
+                round(age.total_seconds() / 86400, 2),
+                ts,
+            )
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"  [WARN parse-date] {ts} ({e})")
+        # In caso di problemi di parsing meglio non bloccare la notifica
+        return True
 
 
 def fetch_items(scraper, base_url, query):
@@ -163,7 +211,7 @@ def send_summary(items):
 
 
 def main():
-    log.info(f"=== Avvio \u2014 {datetime.now().strftime('%H:%M:%S')} ===")
+    log.info(f"=== Avvio — {datetime.now().strftime('%H:%M:%S')} ===")
 
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False})
@@ -177,7 +225,7 @@ def main():
     if is_first_run:
         log.info("*** PRIMO AVVIO: popolo baseline seen_ids senza notificare ***")
     else:
-        log.info(f"ID gi\u00e0 visti: {len(seen_ids)}")
+        log.info(f"ID già visti: {len(seen_ids)}")
 
     all_items_map = {}
     for domain in VINTED_DOMAINS:
@@ -211,10 +259,10 @@ def main():
         )
         return
 
-    # Run normale: notifica solo i nuovi non ancora visti
+    # Run normale: notifica solo i nuovi non ancora visti e recenti
     new_items = [
         item for item_id, item in all_items_map.items()
-        if item_id not in seen_ids and is_relevant(item)
+        if item_id not in seen_ids and is_relevant(item) and is_recent(item)
     ]
     new_items.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
 
@@ -226,7 +274,7 @@ def main():
         send_summary(new_items)
         log.info(f"Notifica inviata: {len(new_items)} annunci")
     else:
-        log.info("Nessun annuncio nuovo \u2014 nessuna notifica.")
+        log.info("Nessun annuncio nuovo — nessuna notifica.")
 
     # Marca come visti anche gli annunci non-PSP per non riprocessarli
     for item_id in all_items_map:
