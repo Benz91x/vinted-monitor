@@ -15,7 +15,7 @@ PRICE_MAX        = 70
 STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
 RETRY_DELAY      = 4
-MAX_AGE_HOURS    = 2   # notifica solo annunci delle ultime 2 ore
+MAX_AGE_HOURS    = 2
 MAX_SEEN         = 500
 
 VINTED_DOMAINS = [
@@ -75,22 +75,60 @@ def save_state(state):
 
 
 # ---------------------------------------------------------------------------
-# Filtro data: solo annunci delle ultime MAX_AGE_HOURS ore
+# Filtro data
+# Vinted restituisce il timestamp in piu' campi, li proviamo tutti
 # ---------------------------------------------------------------------------
-def is_recent(item):
-    created_at = item.get("created_at_ts") or item.get("updated_at_ts")
-    if not created_at:
-        # Se non c'e' timestamp, lo accettiamo (meglio un falso positivo)
-        return True
+def get_item_timestamp(item):
+    """Estrai il timestamp unix dall'item, prova tutti i campi noti."""
+    # Campo diretto
+    for field in ("created_at_ts", "updated_at_ts", "last_push_up_at"):
+        val = item.get(field)
+        if val:
+            try:
+                return int(val)
+            except Exception:
+                pass
+
+    # Campo stringa ISO: "2024-11-20T10:30:00+02:00"
+    for field in ("created_at", "updated_at"):
+        val = item.get(field)
+        if val and isinstance(val, str):
+            try:
+                # Python 3.7+ fromisoformat non regge il +02:00 su tutte le versioni
+                val = val.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(val)
+                return int(dt.timestamp())
+            except Exception:
+                pass
+
+    # Annidato in photo
     try:
-        ts = datetime.fromtimestamp(int(created_at), tz=timezone.utc)
-        age = datetime.now(timezone.utc) - ts
-        if age > timedelta(hours=MAX_AGE_HOURS):
-            log.info(f"  [SKIP vecchio {age}] {item.get('title')}")
-            return False
-        return True
+        ts = item["photo"]["high_resolution"]["timestamp"]
+        if ts:
+            return int(ts)
     except Exception:
+        pass
+
+    return None
+
+
+def is_recent(item):
+    ts = get_item_timestamp(item)
+    if ts is None:
+        # Nessun timestamp trovato: logga i campi disponibili per debug e rifiuta
+        log.warning(f"  [NO TIMESTAMP] campi: {list(item.keys())} | title: {item.get('title')}")
+        return False  # meglio scartare che notificare roba vecchia
+    try:
+        dt  = datetime.fromtimestamp(ts, tz=timezone.utc)
+        age = datetime.now(timezone.utc) - dt
+        if age > timedelta(hours=MAX_AGE_HOURS):
+            log.info(f"  [SKIP vecchio age={age}] {item.get('title')}")
+            return False
+        log.info(f"  [RECENTE age={age}] {item.get('title')}")
         return True
+    except Exception as e:
+        log.warning(f"  [TIMESTAMP ERR {e}] {item.get('title')}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +152,7 @@ def is_relevant(item):
 
 
 # ---------------------------------------------------------------------------
-# Fetch con retry
+# Fetch con retry - logga il primo item raw per debug timestamp
 # ---------------------------------------------------------------------------
 def fetch_items(scraper, base_url, query):
     for attempt in range(1, RETRY_ATTEMPTS + 1):
@@ -138,6 +176,11 @@ def fetch_items(scraper, base_url, query):
             r.raise_for_status()
             items = r.json().get("items", [])
             log.info(f"[{base_url}][{query}] tentativo {attempt} -> {len(items)} items")
+            # Log struttura primo item per capire quali campi timestamp esistono
+            if items:
+                sample = items[0]
+                ts_fields = {k: sample[k] for k in sample if "at" in k or "ts" in k or "push" in k}
+                log.info(f"  SAMPLE timestamp fields: {ts_fields}")
             for item in items:
                 item["_domain"] = base_url
             return items
@@ -217,7 +260,6 @@ def main():
     seen_ids = set(state["seen_ids"])
     log.info(f"seen_ids caricati: {len(seen_ids)}")
 
-    # Scarica annunci PSP rilevanti E recenti
     all_psp = {}
     for domain in VINTED_DOMAINS:
         try:
@@ -238,10 +280,9 @@ def main():
     log.info(f"Annunci PSP recenti e rilevanti: {len(all_psp)}")
 
     if not all_psp:
-        log.info("Nessun annuncio PSP recente trovato. State NON aggiornato.")
+        log.info("Nessun annuncio PSP recente. State NON aggiornato.")
         return
 
-    # Notifica solo quelli non ancora visti
     new_items = [
         item for iid, item in all_psp.items()
         if iid not in seen_ids
@@ -256,7 +297,6 @@ def main():
     else:
         log.info("Nessun annuncio nuovo.")
 
-    # Aggiorna seen_ids
     state["seen_ids"] = list(seen_ids | set(all_psp.keys()))
     save_state(state)
     log.info("=== Fine ciclo ===")
