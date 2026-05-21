@@ -4,7 +4,7 @@ import time
 import requests
 import cloudscraper
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ---------------------------------------------------------------------------
 # Config
@@ -15,6 +15,8 @@ PRICE_MAX        = 70
 STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
 RETRY_DELAY      = 4
+MAX_AGE_HOURS    = 2   # notifica solo annunci delle ultime 2 ore
+MAX_SEEN         = 500
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -51,12 +53,8 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# State — usa seen_ids: set di ID PSP gia' notificati
-# Salviamo gli ultimi 500 ID per non mandare duplicati
-# Il max_id NON serve piu': confrontiamo direttamente gli ID nel set
+# State
 # ---------------------------------------------------------------------------
-MAX_SEEN = 500
-
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -66,15 +64,33 @@ def load_state():
                     return data
         except Exception:
             pass
-    return {"seen_ids": [], "bootstrapped": False}
+    return {"seen_ids": []}
 
 
 def save_state(state):
-    # Mantieni solo gli ultimi MAX_SEEN id
     state["seen_ids"] = state["seen_ids"][-MAX_SEEN:]
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
-    log.info(f"State salvato: {len(state['seen_ids'])} seen_ids, bootstrapped={state['bootstrapped']}")
+    log.info(f"State salvato: {len(state['seen_ids'])} seen_ids")
+
+
+# ---------------------------------------------------------------------------
+# Filtro data: solo annunci delle ultime MAX_AGE_HOURS ore
+# ---------------------------------------------------------------------------
+def is_recent(item):
+    created_at = item.get("created_at_ts") or item.get("updated_at_ts")
+    if not created_at:
+        # Se non c'e' timestamp, lo accettiamo (meglio un falso positivo)
+        return True
+    try:
+        ts = datetime.fromtimestamp(int(created_at), tz=timezone.utc)
+        age = datetime.now(timezone.utc) - ts
+        if age > timedelta(hours=MAX_AGE_HOURS):
+            log.info(f"  [SKIP vecchio {age}] {item.get('title')}")
+            return False
+        return True
+    except Exception:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -197,14 +213,12 @@ def main():
         "Accept-Language": "it-IT,it;q=0.9,es;q=0.8,fr;q=0.7,de;q=0.6",
     })
 
-    state = load_state()
+    state    = load_state()
     seen_ids = set(state["seen_ids"])
-    bootstrapped = state.get("bootstrapped", False)
+    log.info(f"seen_ids caricati: {len(seen_ids)}")
 
-    log.info(f"Stato: bootstrapped={bootstrapped}, seen_ids={len(seen_ids)}")
-
-    # Scarica tutti gli annunci PSP rilevanti
-    all_psp = {}  # id -> item
+    # Scarica annunci PSP rilevanti E recenti
+    all_psp = {}
     for domain in VINTED_DOMAINS:
         try:
             scraper.get(domain, timeout=15)
@@ -217,40 +231,24 @@ def main():
                     iid = int(item["id"])
                 except (KeyError, ValueError):
                     continue
-                # Deduplicazione cross-dominio/query
-                if iid not in all_psp and is_relevant(item):
+                if iid not in all_psp and is_relevant(item) and is_recent(item):
                     all_psp[iid] = item
             time.sleep(1)
 
-    log.info(f"Annunci PSP rilevanti trovati: {len(all_psp)}")
+    log.info(f"Annunci PSP recenti e rilevanti: {len(all_psp)}")
 
     if not all_psp:
-        log.warning("Nessun annuncio PSP trovato — API bloccata o nessun risultato. State NON aggiornato.")
+        log.info("Nessun annuncio PSP recente trovato. State NON aggiornato.")
         return
 
-    if not bootstrapped:
-        # Primo avvio: salva tutti gli ID attuali come baseline, non notificare
-        new_seen = list(seen_ids | set(all_psp.keys()))
-        state["seen_ids"]    = new_seen
-        state["bootstrapped"] = True
-        save_state(state)
-        log.info(f"Baseline: {len(all_psp)} annunci PSP salvati. Dal prossimo run partono le notifiche.")
-        send_telegram(
-            f"\U0001f527 *Monitor PSP avviato!*\n"
-            f"Trovati {len(all_psp)} annunci esistenti (non notificati).\n"
-            f"Dal prossimo run riceverai solo i nuovi \U0001f680"
-        )
-        return
-
-    # Run normale: notifica solo annunci NON ancora visti
+    # Notifica solo quelli non ancora visti
     new_items = [
         item for iid, item in all_psp.items()
         if iid not in seen_ids
     ]
-    # Ordina per ID decrescente (piu' recente prima)
     new_items.sort(key=lambda x: int(x["id"]), reverse=True)
 
-    log.info(f"Nuovi annunci PSP da notificare: {len(new_items)}")
+    log.info(f"Nuovi da notificare: {len(new_items)}")
 
     if new_items:
         send_summary(new_items)
@@ -258,9 +256,8 @@ def main():
     else:
         log.info("Nessun annuncio nuovo.")
 
-    # Aggiorna seen_ids con tutti gli ID PSP visti in questo run
-    state["seen_ids"]    = list(seen_ids | set(all_psp.keys()))
-    state["bootstrapped"] = True
+    # Aggiorna seen_ids
+    state["seen_ids"] = list(seen_ids | set(all_psp.keys()))
     save_state(state)
     log.info("=== Fine ciclo ===")
 
