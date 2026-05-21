@@ -1,10 +1,11 @@
 import os, json, requests, cloudscraper, logging
-from datetime import datetime, timezone
+from datetime import datetime
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
+MAX_SEEN_IDS     = 5000  # quanti ID tenere in memoria
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -12,9 +13,6 @@ VINTED_DOMAINS = [
     "https://www.vinted.fr",
     "https://www.vinted.de",
 ]
-
-MAX_AGE_HOURS = 24
-ID_PER_HOUR   = 416_000
 
 SEARCH_QUERIES = [
     "PSP",
@@ -52,43 +50,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
 
-def get_min_id_threshold(items_sample):
-    if not items_sample:
-        return 0
-    max_id = max(int(item.get("id", 0)) for item in items_sample)
-    threshold = max_id - (ID_PER_HOUR * MAX_AGE_HOURS)
-    log.info(f"ID max nel fetch: {max_id} | Soglia {MAX_AGE_HOURS}h: {threshold}")
-    return threshold
-
-
-def estimate_upload_time(item, max_id_in_fetch):
-    """
-    Stima l'ora di caricamento basandosi sulla differenza di ID rispetto
-    all'annuncio piu' recente del fetch. Non e' precisa al minuto ma
-    da' un'indicazione affidabile (es. 'circa 2 ore fa').
-    """
-    item_id = int(item.get("id", 0))
-    id_diff = max_id_in_fetch - item_id
-    minutes_ago = id_diff / (ID_PER_HOUR / 60)  # ID_PER_HOUR / 60 = ID al minuto
-    now = datetime.now(timezone.utc)
-    from datetime import timedelta
-    estimated_dt = now - timedelta(minutes=minutes_ago)
-    return estimated_dt, int(minutes_ago)
-
-
-def format_upload_label(minutes_ago, estimated_dt):
-    """Restituisce una stringa leggibile tipo 'caricato ~5 min fa' o 'caricato ~2 ore fa'."""
-    if minutes_ago < 2:
-        return "caricato ~adesso"
-    elif minutes_ago < 60:
-        return f"caricato ~{int(minutes_ago)} min fa"
-    elif minutes_ago < 120:
-        return f"caricato ~1 ora fa"
-    else:
-        ore = int(minutes_ago / 60)
-        return f"caricato ~{ore} ore fa"
-
-
 def load_seen_ids():
     if os.path.exists(SEEN_IDS_FILE):
         with open(SEEN_IDS_FILE) as f:
@@ -96,19 +57,12 @@ def load_seen_ids():
     return set()
 
 
-def save_seen_ids(seen_ids, min_id_threshold):
-    ids_to_keep = {sid for sid in seen_ids if int(sid) >= min_id_threshold}
+def save_seen_ids(seen_ids):
+    # Tieni solo gli ultimi MAX_SEEN_IDS (i piu' alti = piu' recenti)
+    ordered = sorted(seen_ids, key=lambda x: int(x), reverse=True)[:MAX_SEEN_IDS]
     with open(SEEN_IDS_FILE, "w") as f:
-        json.dump(list(ids_to_keep)[-2000:], f)
-    log.info(f"seen_ids salvati: {len(ids_to_keep)} (rimossi {len(seen_ids)-len(ids_to_keep)} vecchi)")
-
-
-def is_fresh(item, min_id_threshold):
-    item_id = int(item.get("id", 0))
-    if item_id < min_id_threshold:
-        log.info(f"  [SKIP vecchio ID={item_id}] {item.get('title')}")
-        return False
-    return True
+        json.dump(ordered, f)
+    log.info(f"seen_ids salvati: {len(ordered)}")
 
 
 def is_relevant(item):
@@ -117,10 +71,12 @@ def is_relevant(item):
     brand = (item.get("brand_title") or "").lower()
     full_text = f"{title} {description} {brand}"
 
+    # Deve avere PSP nel titolo
     if not any(t in title for t in PSP_TITLE_TERMS):
         log.info(f"  [SKIP no-psp-titolo] {item.get('title')}")
         return False
 
+    # Non deve avere keyword blacklist
     for kw in BLACKLIST_KEYWORDS:
         if kw in full_text:
             log.info(f"  [SKIP blacklist='{kw}'] {item.get('title')}")
@@ -170,19 +126,14 @@ def item_url(item):
     return item.get("url") or f"{domain}/items/{item.get('id', '')}"
 
 
-def send_summary(items, max_id_in_fetch):
+def send_summary(items):
     header = f"🎮 *{len(items)} nuov{'o' if len(items)==1 else 'i'} annunci PSP su Vinted!*\n\n"
     lines = []
     for item in items:
         amount, currency = get_price(item)
-        title  = item.get("title", "N/D")
-        url    = item_url(item)
-        _, minutes_ago = estimate_upload_time(item, max_id_in_fetch)
-        label  = format_upload_label(minutes_ago, None)
-        lines.append(
-            f"🎮 [{title}]({url})\n"
-            f"💶 *{amount} {currency}*  ⏰ _{label}_\n"
-        )
+        title = item.get("title", "N/D")
+        url   = item_url(item)
+        lines.append(f"🎮 [{title}]({url})\n💶 *{amount} {currency}*\n")
 
     MAX_LEN = 4000
     chunks, current = [], header
@@ -234,28 +185,32 @@ def main():
                 if item_id not in all_items_map:
                     all_items_map[item_id] = item
 
-    log.info(f"Articoli unici totali (pre-filtro): {len(all_items_map)}")
+    log.info(f"Articoli unici totali: {len(all_items_map)}")
 
-    min_id = get_min_id_threshold(list(all_items_map.values()))
-    max_id = max((int(i.get("id", 0)) for i in all_items_map.values()), default=0)
-
+    # Nuovi = non ancora visti + pertinenti (PSP reale, no blacklist)
     new_items = [
         item for item_id, item in all_items_map.items()
-        if item_id not in seen_ids
-        and is_fresh(item, min_id)
-        and is_relevant(item)
+        if item_id not in seen_ids and is_relevant(item)
     ]
-    log.info(f"Nuovi annunci pertinenti e recenti: {len(new_items)}")
+    # Ordina per ID decrescente (piu' recenti prima)
+    new_items.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
+
+    log.info(f"Nuovi annunci pertinenti: {len(new_items)}")
 
     if new_items:
         for item in new_items:
             seen_ids.add(str(item.get("id")))
-        send_summary(new_items, max_id)
+        send_summary(new_items)
         log.info(f"Notifica inviata: {len(new_items)} annunci")
     else:
         log.info("Nessun annuncio nuovo \u2014 nessuna notifica.")
 
-    save_seen_ids(seen_ids, min_id)
+    # Aggiorna sempre seen_ids con TUTTI gli ID visti (anche quelli non PSP)
+    # cosi' al prossimo run non li riprocessiamo
+    for item_id in all_items_map:
+        seen_ids.add(item_id)
+
+    save_seen_ids(seen_ids)
     log.info("=== Fine ciclo ===")
 
 
