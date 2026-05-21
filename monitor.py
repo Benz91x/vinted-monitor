@@ -11,7 +11,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-PRICE_MAX        = 60
+PRICE_MAX        = 70
 STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
 RETRY_DELAY      = 4   # secondi tra i retry
@@ -58,7 +58,6 @@ def load_state():
         try:
             with open(STATE_FILE) as f:
                 data = json.load(f)
-                # Considera valido solo se ha max_id
                 if data.get("max_id"):
                     return data
         except Exception:
@@ -199,7 +198,6 @@ def main():
     else:
         log.info(f"Stato caricato: {state}")
 
-    # Scarica tutti gli annunci
     all_items = {}
     for domain in VINTED_DOMAINS:
         try:
@@ -215,11 +213,10 @@ def main():
                     continue
                 if iid not in all_items:
                     all_items[iid] = item
-            time.sleep(1)  # pausa tra query per non farsi bloccare
+            time.sleep(1)
 
     log.info(f"Articoli unici totali: {len(all_items)}")
 
-    # IMPORTANTE: se 0 articoli, non aggiornare lo state (potrebbe essere un blocco temporaneo)
     if not all_items:
         log.warning("Nessun articolo ricevuto dall'API — state NON aggiornato, esco.")
         return
