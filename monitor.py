@@ -1,14 +1,18 @@
-import os, json, requests, cloudscraper, logging
-from datetime import datetime, timezone, timedelta
+import os
+import json
+import requests
+import cloudscraper
+import logging
+from datetime import datetime
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
 MAX_SEEN_IDS     = 5000
-# Finestra massima di età per considerare un annuncio "recente" (in ore)
-# Di default usiamo 1 ora, così anche senza variabile d'ambiente non arrivano annunci vecchi.
-MAX_ITEM_AGE_HOURS = float(os.environ.get("MAX_ITEM_AGE_HOURS", "1"))
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -24,8 +28,6 @@ SEARCH_QUERIES = [
     "psp 2000",
     "psp 3000",
     "psp go",
-    "consola psp",
-    "console psp",
 ]
 
 BLACKLIST_KEYWORDS = [
@@ -33,19 +35,16 @@ BLACKLIST_KEYWORDS = [
     "playstation 4", "playstation 5", "playstation 3", "playstation 2",
     "xbox", "nintendo", "switch", "wii",
     "carta", "carte", "card", "cards",
-    "pokemon", "pokémon", "yugioh", "yu-gi-oh", "magic the gathering", "mtg",
+    "pokemon", "pokemon", "yugioh", "yu-gi-oh",
     "amiibo", "funko",
-    "cover", "custodia", "borsa", "zaino", "poster", "tazza",
+    "cover", "custodia", "borsa", "zaino", "poster",
     "felpa", "maglietta", "t-shirt",
     "umd film", "umd movie",
-    "president safety",
-    "p.s.p",
 ]
 
-PSP_TITLE_TERMS = [
+PSP_TERMS = [
     "psp",
     "playstation portable",
-    "playstation-portable",
     "ps portable",
 ]
 
@@ -53,68 +52,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# seen_ids helpers
+# ---------------------------------------------------------------------------
 def load_seen_ids():
-    """Restituisce (seen_ids, is_first_run).
-    is_first_run=True se il file non esiste o e' vuoto: in quel caso
-    il run corrente serve solo a popolare il baseline, senza notifiche.
-    """
     if os.path.exists(SEEN_IDS_FILE):
         with open(SEEN_IDS_FILE) as f:
             data = json.load(f)
-        if data:  # file esiste ed e' popolato
+        if data:
             return set(str(i) for i in data), False
-    return set(), True  # file mancante o vuoto = primo avvio
+    return set(), True
 
 
 def save_seen_ids(seen_ids):
+    # Mantieni solo gli ID più recenti (numericamente più alti)
     ordered = sorted(seen_ids, key=lambda x: int(x), reverse=True)[:MAX_SEEN_IDS]
     with open(SEEN_IDS_FILE, "w") as f:
         json.dump(ordered, f)
     log.info(f"seen_ids salvati: {len(ordered)}")
 
 
-def parse_vinted_ts(item):
-    """Per coerenza con l'etichetta "Caricato" usiamo SOLO la data di creazione.
-
-    Alcuni campi (updated_at_ts, last_push_up_at, active_at) cambiano con i bump
-    e potrebbero far sembrare "recenti" annunci molto vecchi.
-    """
-    ts = item.get("created_at_ts") or item.get("created_at")
-    if not ts:
-        return None
-    try:
-        # Gestisce sia ISO stringhe sia epoch numerici (secondi/ms)
-        if isinstance(ts, (int, float)):
-            val = float(ts)
-            if val > 9_999_999_999:  # ms
-                val /= 1000.0
-            dt = datetime.fromtimestamp(val, tz=timezone.utc)
-        else:
-            s = str(ts).replace("Z", "+00:00")
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            else:
-                dt = dt.astimezone(timezone.utc)
-        return dt
-    except Exception as e:
-        log.warning(f"  [WARN parse created_at_ts] {ts} ({e})")
-        return None
-
-
+# ---------------------------------------------------------------------------
+# Filtro pertinenza
+# ---------------------------------------------------------------------------
 def is_relevant(item):
-    """Un annuncio è pertinente se parla di PSP e non contiene keyword in blacklist.
-
-    Cerchiamo i termini PSP nel testo completo (titolo + descrizione + brand),
-    così non perdiamo lotti dove "PSP" è solo in descrizione.
-    """
-    title = (item.get("title") or "").lower()
+    title       = (item.get("title") or "").lower()
     description = (item.get("description") or "").lower()
-    brand = (item.get("brand_title") or "").lower()
-    full_text = f"{title} {description} {brand}"
+    brand       = (item.get("brand_title") or "").lower()
+    full_text   = f"{title} {description} {brand}"
 
-    if not any(t in full_text for t in PSP_TITLE_TERMS):
-        log.info(f"  [SKIP no-psp-text] {item.get('title')}")
+    if not any(t in full_text for t in PSP_TERMS):
         return False
 
     for kw in BLACKLIST_KEYWORDS:
@@ -125,43 +92,18 @@ def is_relevant(item):
     return True
 
 
-def is_recent(item):
-    """True solo se l'annuncio è stato CARICATO di recente.
-
-    Usiamo solo created_at_ts/created_at per evitare che i bump (push up) di annunci
-    vecchi li facciano sembrare nuovi.
-    """
-    dt = parse_vinted_ts(item)
-    if dt is None:
-        # Se non c'è data di creazione, NON lo consideriamo recente
-        log.info("  [SKIP no-created_at] %s", item.get("title"))
-        return False
-
-    now = datetime.now(timezone.utc)
-    age = now - dt
-    if age.total_seconds() < 0:
-        return True
-
-    if age > timedelta(hours=MAX_ITEM_AGE_HOURS):
-        log.info(
-            "  [SKIP troppo vecchio] %s (age=%sd, created_at_ts=%s)",
-            item.get("title"),
-            round(age.total_seconds() / 86400, 2),
-            dt.isoformat(),
-        )
-        return False
-    return True
-
-
+# ---------------------------------------------------------------------------
+# Fetch
+# ---------------------------------------------------------------------------
 def fetch_items(scraper, base_url, query):
     try:
         r = scraper.get(
             f"{base_url}/api/v2/catalog/items",
             params={
-                "search_text":  query,
-                "price_to":     PRICE_MAX,
-                "order":        "newest_first",
-                "per_page":     96,
+                "search_text":   query,
+                "price_to":      PRICE_MAX,
+                "order":         "newest_first",
+                "per_page":      96,
                 "status_ids[]": 1,
             },
             headers={
@@ -182,6 +124,9 @@ def fetch_items(scraper, base_url, query):
         return []
 
 
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
 def get_price(item):
     price = item.get("price", {})
     if isinstance(price, dict):
@@ -195,13 +140,13 @@ def item_url(item):
 
 
 def send_summary(items):
-    header = f"🎮 *{len(items)} nuov{'o' if len(items)==1 else 'i'} annunci PSP su Vinted!*\n\n"
+    header = f"\U0001f3ae *{len(items)} nuov{'o' if len(items)==1 else 'i'} annunci PSP su Vinted!*\n\n"
     lines = []
     for item in items:
         amount, currency = get_price(item)
         title = item.get("title", "N/D")
         url   = item_url(item)
-        lines.append(f"🎮 [{title}]({url})\n💶 *{amount} {currency}*\n")
+        lines.append(f"\U0001f3ae [{title}]({url})\n\U0001f4b6 *{amount} {currency}*\n")
 
     MAX_LEN = 4000
     chunks, current = [], header
@@ -227,8 +172,11 @@ def send_summary(items):
         )
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
-    log.info(f"=== Avvio — {datetime.now().strftime('%H:%M:%S')} ===")
+    log.info(f"=== Avvio {datetime.now().strftime('%H:%M:%S')} ===")
 
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False})
@@ -244,6 +192,7 @@ def main():
     else:
         log.info(f"ID già visti: {len(seen_ids)}")
 
+    # Scarica tutti gli annunci dalle varie combinazioni dominio x query
     all_items_map = {}
     for domain in VINTED_DOMAINS:
         try:
@@ -259,33 +208,32 @@ def main():
     log.info(f"Articoli unici totali: {len(all_items_map)}")
 
     if is_first_run:
-        # Primo avvio: marca tutto come visto, nessuna notifica
+        # Primo avvio: segna tutto come visto, nessuna notifica
         for item_id in all_items_map:
             seen_ids.add(item_id)
         save_seen_ids(seen_ids)
         log.info(f"Baseline salvato: {len(seen_ids)} ID. Dal prossimo run partono le notifiche.")
-        # Manda un messaggio di conferma su Telegram
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={
                 "chat_id":    TELEGRAM_CHAT_ID,
-                "text":       f"🔧 Monitor PSP avviato!\nBaseline di {len(seen_ids)} annunci salvato.\nDal prossimo run riceverai solo i nuovi annunci 🚀",
+                "text":       f"\U0001f527 Monitor PSP avviato!\nBaseline di {len(seen_ids)} annunci salvato.\nDal prossimo run riceverai solo i nuovi annunci \U0001f680",
                 "parse_mode": "Markdown",
             },
             timeout=15,
         )
         return
 
-    # Run normale: notifica solo i nuovi non ancora visti e recenti
+    # ---------------------------------------------------------------------------
+    # Run normale: notifica solo annunci mai visti E pertinenti
+    # NESSUN filtro per età: evitiamo di perdere annunci recenti per problemi di
+    # timezone o timestamp mancante dall'API Vinted.
+    # ---------------------------------------------------------------------------
     new_items = [
-        item for item_id, item in all_items_map.items()
-        if item_id not in seen_ids and is_relevant(item) and is_recent(item)
+        item
+        for item_id, item in all_items_map.items()
+        if item_id not in seen_ids and is_relevant(item)
     ]
-    # Ordiniamo usando il created_at reale, non solo l'ID
-    new_items.sort(
-        key=lambda x: parse_vinted_ts(x) or datetime.fromtimestamp(0, tz=timezone.utc),
-        reverse=True,
-    )
 
     log.info(f"Nuovi annunci pertinenti: {len(new_items)}")
 
@@ -297,7 +245,7 @@ def main():
     else:
         log.info("Nessun annuncio nuovo — nessuna notifica.")
 
-    # Marca come visti anche gli annunci non-PSP per non riprocessarli
+    # Segna come visti anche gli annunci non pertinenti per non riprocessarli
     for item_id in all_items_map:
         seen_ids.add(item_id)
 
