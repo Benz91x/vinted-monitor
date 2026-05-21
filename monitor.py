@@ -5,7 +5,7 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
-MAX_SEEN_IDS     = 5000  # quanti ID tenere in memoria
+MAX_SEEN_IDS     = 5000
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -51,14 +51,19 @@ log = logging.getLogger(__name__)
 
 
 def load_seen_ids():
+    """Restituisce (seen_ids, is_first_run).
+    is_first_run=True se il file non esiste o e' vuoto: in quel caso
+    il run corrente serve solo a popolare il baseline, senza notifiche.
+    """
     if os.path.exists(SEEN_IDS_FILE):
         with open(SEEN_IDS_FILE) as f:
-            return set(str(i) for i in json.load(f))
-    return set()
+            data = json.load(f)
+        if data:  # file esiste ed e' popolato
+            return set(str(i) for i in data), False
+    return set(), True  # file mancante o vuoto = primo avvio
 
 
 def save_seen_ids(seen_ids):
-    # Tieni solo gli ultimi MAX_SEEN_IDS (i piu' alti = piu' recenti)
     ordered = sorted(seen_ids, key=lambda x: int(x), reverse=True)[:MAX_SEEN_IDS]
     with open(SEEN_IDS_FILE, "w") as f:
         json.dump(ordered, f)
@@ -71,12 +76,10 @@ def is_relevant(item):
     brand = (item.get("brand_title") or "").lower()
     full_text = f"{title} {description} {brand}"
 
-    # Deve avere PSP nel titolo
     if not any(t in title for t in PSP_TITLE_TERMS):
         log.info(f"  [SKIP no-psp-titolo] {item.get('title')}")
         return False
 
-    # Non deve avere keyword blacklist
     for kw in BLACKLIST_KEYWORDS:
         if kw in full_text:
             log.info(f"  [SKIP blacklist='{kw}'] {item.get('title')}")
@@ -170,8 +173,11 @@ def main():
         "Accept-Language": "it-IT,it;q=0.9,es;q=0.8,fr;q=0.7,de;q=0.6",
     })
 
-    seen_ids = load_seen_ids()
-    log.info(f"ID gi\u00e0 visti: {len(seen_ids)}")
+    seen_ids, is_first_run = load_seen_ids()
+    if is_first_run:
+        log.info("*** PRIMO AVVIO: popolo baseline seen_ids senza notificare ***")
+    else:
+        log.info(f"ID gi\u00e0 visti: {len(seen_ids)}")
 
     all_items_map = {}
     for domain in VINTED_DOMAINS:
@@ -187,12 +193,29 @@ def main():
 
     log.info(f"Articoli unici totali: {len(all_items_map)}")
 
-    # Nuovi = non ancora visti + pertinenti (PSP reale, no blacklist)
+    if is_first_run:
+        # Primo avvio: marca tutto come visto, nessuna notifica
+        for item_id in all_items_map:
+            seen_ids.add(item_id)
+        save_seen_ids(seen_ids)
+        log.info(f"Baseline salvato: {len(seen_ids)} ID. Dal prossimo run partono le notifiche.")
+        # Manda un messaggio di conferma su Telegram
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={
+                "chat_id":    TELEGRAM_CHAT_ID,
+                "text":       f"🔧 Monitor PSP avviato!\nBaseline di {len(seen_ids)} annunci salvato.\nDal prossimo run riceverai solo i nuovi annunci 🚀",
+                "parse_mode": "Markdown",
+            },
+            timeout=15,
+        )
+        return
+
+    # Run normale: notifica solo i nuovi non ancora visti
     new_items = [
         item for item_id, item in all_items_map.items()
         if item_id not in seen_ids and is_relevant(item)
     ]
-    # Ordina per ID decrescente (piu' recenti prima)
     new_items.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
 
     log.info(f"Nuovi annunci pertinenti: {len(new_items)}")
@@ -205,8 +228,7 @@ def main():
     else:
         log.info("Nessun annuncio nuovo \u2014 nessuna notifica.")
 
-    # Aggiorna sempre seen_ids con TUTTI gli ID visti (anche quelli non PSP)
-    # cosi' al prossimo run non li riprocessiamo
+    # Marca come visti anche gli annunci non-PSP per non riprocessarli
     for item_id in all_items_map:
         seen_ids.add(item_id)
 
