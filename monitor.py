@@ -1,11 +1,14 @@
 import os, json, requests, cloudscraper, logging, re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 VINTED_BASE_URL  = "https://www.vinted.it"
 PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
+
+# Scarta annunci pubblicati da più di MAX_AGE_DAYS giorni
+MAX_AGE_DAYS = 3
 
 # Query multiple: ogni stringa viene cercata separatamente su Vinted
 SEARCH_QUERIES = [
@@ -19,18 +22,14 @@ SEARCH_QUERIES = [
 
 # Parole chiave che fanno scartare l'annuncio (case-insensitive)
 BLACKLIST_KEYWORDS = [
-    # giochi / software non PSP
     "ps4", "ps5", "ps3", "ps2", "playstation 4", "playstation 5",
     "playstation 3", "playstation 2",
     "xbox", "nintendo", "switch", "wii",
-    # carte collezionabili e merchandise
     "carta", "carte", "card", "cards", "pokemon", "pok\u00e9mon",
     "yugioh", "yu-gi-oh", "magic the gathering", "mtg",
     "amiibo", "funko",
-    # accessori non console
     "cover", "custodia", "borsa", "zaino", "poster", "tazza",
     "felpa", "maglietta", "t-shirt",
-    # UMD film (non giochi PSP)
     "umd film", "umd movie",
 ]
 
@@ -50,6 +49,42 @@ def save_seen_ids(seen_ids):
         json.dump(list(seen_ids)[-2000:], f)
 
 
+def is_recent(item):
+    """
+    Restituisce True se l'annuncio è stato pubblicato entro MAX_AGE_DAYS giorni.
+    Controlla i campi 'created_at_ts' (unix timestamp) o 'created_at' (ISO string).
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=MAX_AGE_DAYS)
+
+    # Prova prima il timestamp unix
+    ts = item.get("created_at_ts") or item.get("updated_at_ts")
+    if ts:
+        try:
+            created = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            if created < cutoff:
+                log.info(f"  [SKIP troppo vecchio: {created.date()}] {item.get('title')}")
+                return False
+            return True
+        except Exception:
+            pass
+
+    # Fallback: stringa ISO
+    iso = item.get("created_at") or item.get("updated_at")
+    if iso:
+        try:
+            created = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            if created < cutoff:
+                log.info(f"  [SKIP troppo vecchio: {created.date()}] {item.get('title')}")
+                return False
+            return True
+        except Exception:
+            pass
+
+    # Se non riesce a leggere la data, lascia passare l'annuncio
+    return True
+
+
 def is_relevant(item):
     """Restituisce True se l'annuncio è pertinente (console/accessori PSP)."""
     title       = item.get("title", "").lower()
@@ -57,13 +92,11 @@ def is_relevant(item):
     brand       = (item.get("brand_title") or "").lower()
     text        = f"{title} {description} {brand}"
 
-    # Scarta se contiene parole blacklist
     for kw in BLACKLIST_KEYWORDS:
         if kw in text:
             log.info(f"  [SKIP blacklist='{kw}'] {item.get('title')}")
             return False
 
-    # Il titolo deve contenere almeno uno dei termini PSP
     psp_terms = ["psp", "playstation portable"]
     if not any(t in title for t in psp_terms):
         log.info(f"  [SKIP no-psp-in-title] {item.get('title')}")
@@ -79,7 +112,7 @@ def fetch_items(scraper, query):
         "price_to":     PRICE_MAX,
         "order":        "newest_first",
         "per_page":     96,
-        "status_ids[]": 1,   # 1 = disponibile (non venduto)
+        "status_ids[]": 1,
     }
     headers = {
         "Accept":           "application/json, text/plain, */*",
@@ -111,18 +144,13 @@ def item_url(item):
 
 
 def get_photo_url(item):
-    """Estrae l'URL della foto principale dell'annuncio."""
-    # L'API può restituire 'photos' (lista) oppure 'photo' (dict singolo)
     photos = item.get("photos")
     if photos and isinstance(photos, list) and len(photos) > 0:
         p = photos[0]
     else:
         p = item.get("photo") or item.get("image") or {}
-
     if not p:
         return None
-
-    # Prova campi in ordine di preferenza (alta risoluzione prima)
     for field in ("full_size_url", "url", "thumb_url"):
         url = p.get(field)
         if url:
@@ -131,19 +159,32 @@ def get_photo_url(item):
 
 
 def send_photo_item(item):
-    """
-    Invia UN messaggio per articolo con foto + didascalia.
-    Se la foto non è disponibile, cade su un messaggio di testo.
-    """
     amount, currency = get_price(item)
-    title   = item.get("title", "N/D")
-    url     = item_url(item)
-    photo   = get_photo_url(item)
+    title  = item.get("title", "N/D")
+    url    = item_url(item)
+    photo  = get_photo_url(item)
+
+    # Data pubblicazione leggibile
+    ts = item.get("created_at_ts") or item.get("updated_at_ts")
+    iso = item.get("created_at") or item.get("updated_at")
+    data_str = ""
+    try:
+        if ts:
+            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        elif iso:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        else:
+            dt = None
+        if dt:
+            data_str = f"\n\ud83d\udcc5 Pubblicato: {dt.strftime('%d/%m/%Y %H:%M')}"
+    except Exception:
+        pass
 
     caption = (
-        f"🎮 *{title}*\n"
-        f"💶 *{amount} {currency}*\n"
-        f"🔗 [Vedi su Vinted]({url})"
+        f"\ud83c\udfae *{title}*\n"
+        f"\ud83d\udcb6 *{amount} {currency}*"
+        f"{data_str}\n"
+        f"\ud83d\udd17 [Vedi su Vinted]({url})"
     )
 
     if photo:
@@ -161,7 +202,6 @@ def send_photo_item(item):
             return
         log.warning(f"sendPhoto fallito ({resp.status_code}), fallback testo")
 
-    # Fallback testo
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         data={
@@ -175,8 +215,7 @@ def send_photo_item(item):
 
 
 def send_header(count):
-    """Messaggio introduttivo prima delle schede singole."""
-    text = f"🎮 *{count} nuov{'o' if count == 1 else 'i'} annunci PSP su Vinted!*"
+    text = f"\ud83c\udfae *{count} nuov{'o' if count == 1 else 'i'} annunci PSP su Vinted!*"
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
@@ -184,7 +223,7 @@ def send_header(count):
     )
 
 
-MAX_NOTIFICATIONS = 10  # Max annunci inviati per ciclo (evita flood)
+MAX_NOTIFICATIONS = 10
 
 
 def main():
@@ -210,7 +249,6 @@ def main():
     seen_ids = load_seen_ids()
     log.info(f"ID gi\u00e0 visti: {len(seen_ids)}")
 
-    # Raccoglie articoli da tutte le query, deduplicando per ID
     all_items_map = {}
     for query in SEARCH_QUERIES:
         for item in fetch_items(scraper, query):
@@ -220,15 +258,16 @@ def main():
 
     log.info(f"Articoli unici (pre-filtro): {len(all_items_map)}")
 
-    # Filtra: solo pertinenti e non gi\u00e0 visti
+    # Filtra: recenti + pertinenti + non già visti
     new_items = [
         item for item_id, item in all_items_map.items()
-        if item_id not in seen_ids and is_relevant(item)
+        if item_id not in seen_ids
+        and is_recent(item)
+        and is_relevant(item)
     ]
-    log.info(f"Nuovi annunci pertinenti: {len(new_items)}")
+    log.info(f"Nuovi annunci pertinenti e recenti: {len(new_items)}")
 
     if new_items:
-        # Segna TUTTI come visti (anche quelli oltre il cap) per non rinotificarli
         for item in new_items:
             seen_ids.add(str(item.get("id")))
         save_seen_ids(seen_ids)
@@ -254,7 +293,7 @@ def main():
 
         log.info(f"Notifiche inviate: {len(to_notify)} (+ {extra} non mostrati)")
     else:
-        log.info("Nessun annuncio nuovo pertinente \u2014 nessuna notifica.")
+        log.info("Nessun annuncio nuovo pertinente e recente \u2014 nessuna notifica.")
 
     log.info("=== Fine ciclo ===")
 
