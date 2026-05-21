@@ -103,13 +103,18 @@ def parse_vinted_ts(item):
 
 
 def is_relevant(item):
+    """Un annuncio è pertinente se parla di PSP e non contiene keyword in blacklist.
+
+    Cerchiamo i termini PSP nel testo completo (titolo + descrizione + brand),
+    così non perdiamo lotti dove "PSP" è solo in descrizione.
+    """
     title = (item.get("title") or "").lower()
     description = (item.get("description") or "").lower()
     brand = (item.get("brand_title") or "").lower()
     full_text = f"{title} {description} {brand}"
 
-    if not any(t in title for t in PSP_TITLE_TERMS):
-        log.info(f"  [SKIP no-psp-titolo] {item.get('title')}")
+    if not any(t in full_text for t in PSP_TITLE_TERMS):
+        log.info(f"  [SKIP no-psp-text] {item.get('title')}")
         return False
 
     for kw in BLACKLIST_KEYWORDS:
