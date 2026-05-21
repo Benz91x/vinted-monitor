@@ -54,18 +54,18 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# State — salva la lista degli ID PSP gia' visti (ultimi MAX_SEEN)
+# State
 # ---------------------------------------------------------------------------
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
                 data = json.load(f)
-                if isinstance(data.get("seen_ids"), list):
-                    return data
+                if isinstance(data.get("seen_ids"), list) and len(data["seen_ids"]) > 0:
+                    return data, False  # stato esistente
         except Exception:
             pass
-    return {"seen_ids": []}
+    return {"seen_ids": []}, True  # primo avvio
 
 
 def save_state(state):
@@ -195,12 +195,9 @@ def main():
         "Accept-Language": "it-IT,it;q=0.9,es;q=0.8,fr;q=0.7,de;q=0.6",
     })
 
-    state    = load_state()
+    state, is_first_run = load_state()
     seen_ids = set(state["seen_ids"])
-    log.info(f"seen_ids caricati: {len(seen_ids)}")
-
-    # --- primo avvio: seen_ids vuoto ---
-    is_first_run = len(seen_ids) == 0
+    log.info(f"seen_ids caricati: {len(seen_ids)} | primo_avvio: {is_first_run}")
 
     # Scarica e filtra solo PSP rilevanti
     all_psp = {}
@@ -227,18 +224,13 @@ def main():
         return
 
     if is_first_run:
-        # Salva tutti gli ID attuali come baseline, non notificare
+        # Salva baseline senza notificare nulla su Telegram
         state["seen_ids"] = list(all_psp.keys())
         save_state(state)
-        log.info(f"Baseline: {len(all_psp)} annunci PSP salvati come gia' visti.")
-        send_telegram(
-            f"\U0001f527 *Monitor PSP avviato!*\n"
-            f"Trovati {len(all_psp)} annunci esistenti (non notificati).\n"
-            f"Dal prossimo run riceverai solo i nuovi \U0001f680"
-        )
+        log.info(f"Baseline salvata: {len(all_psp)} annunci PSP. Nessuna notifica inviata.")
         return
 
-    # Notifica solo PSP non ancora visti
+    # Run normale: notifica solo PSP non ancora visti
     new_items = [
         item for iid, item in all_psp.items()
         if iid not in seen_ids
@@ -253,7 +245,6 @@ def main():
     else:
         log.info("Nessun annuncio nuovo.")
 
-    # Aggiorna seen_ids con tutti i PSP visti in questo run
     state["seen_ids"] = list(seen_ids | set(all_psp.keys()))
     save_state(state)
     log.info("=== Fine ciclo ===")
