@@ -59,21 +59,36 @@ def notify(item):
 
 def main():
     log.info(f"=== Avvio ciclo — {datetime.now().strftime('%H:%M:%S')} ===")
-    scraper = cloudscraper.create_scraper(browser={"browser":"chrome","platform":"windows"})
-    scraper.get(VINTED_BASE_URL, timeout=20)
     
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    scraper.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "it-IT,it;q=0.9",
+    })
+
+    # Step 1: homepage per cookie iniziali
+    log.info("Step 1: carico homepage...")
+    scraper.get(VINTED_BASE_URL, timeout=20)
+
+    # Step 2: pagina di ricerca — questo è il passo mancante che sblocca la API
+    log.info("Step 2: carico pagina ricerca...")
+    scraper.get(
+        f"{VINTED_BASE_URL}/catalog",
+        params={"search_text": SEARCH_QUERY, "price_to": PRICE_MAX, "order": "newest_first"},
+        timeout=20
+    )
+
     seen_ids  = load_seen_ids()
     items     = fetch_items(scraper)
     new_items = [i for i in items if str(i.get("id")) not in seen_ids]
-    
+
     log.info(f"Articoli totali: {len(items)} | Nuovi: {len(new_items)}")
     for item in new_items:
         notify(item)
         seen_ids.add(str(item.get("id")))
-    
+
     if new_items:
         save_seen_ids(seen_ids)
     log.info("=== Fine ciclo ===")
-
-if __name__ == "__main__":
-    main()
