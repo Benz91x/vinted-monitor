@@ -1,5 +1,5 @@
 import os, json, requests, cloudscraper, logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -7,8 +7,10 @@ VINTED_BASE_URL  = "https://www.vinted.it"
 PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
 
-# Scarta annunci pubblicati da più di MAX_AGE_HOURS ore
+# Gli ID di Vinted sono sequenziali e crescenti: ~10 milioni/giorno.
+# Filtriamo annunci vecchi confrontando il loro ID con la soglia dinamica.
 MAX_AGE_HOURS = 24
+ID_PER_HOUR   = 416_000  # ~10M ID/giorno / 24
 
 SEARCH_QUERIES = [
     "PSP",
@@ -35,28 +37,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
 
-def get_item_date(item):
+def get_min_id_threshold(items_sample):
     """
-    Legge la data di PUBBLICAZIONE dell'annuncio.
-    Vinted espone 'created_at_ts' (unix) o 'created_at' (ISO).
+    Calcola dinamicamente la soglia minima di ID.
+    Prende l'ID massimo del fetch corrente (= annuncio piu' recente)
+    e sottrae ID_PER_HOUR * MAX_AGE_HOURS.
     """
-    # Preferisce created_at_ts (timestamp creazione)
-    for key in ("created_at_ts", "updated_at_ts"):
-        ts = item.get(key)
-        if ts:
-            try:
-                return datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            except Exception:
-                pass
-    # Fallback stringa ISO
-    for key in ("created_at", "updated_at"):
-        iso = item.get(key)
-        if iso:
-            try:
-                return datetime.fromisoformat(iso.replace("Z", "+00:00"))
-            except Exception:
-                pass
-    return None
+    if not items_sample:
+        return 0
+    max_id = max(int(item.get("id", 0)) for item in items_sample)
+    threshold = max_id - (ID_PER_HOUR * MAX_AGE_HOURS)
+    log.info(f"ID max nel fetch: {max_id} | Soglia {MAX_AGE_HOURS}h: {threshold}")
+    return threshold
 
 
 def load_seen_ids():
@@ -66,31 +58,18 @@ def load_seen_ids():
     return set()
 
 
-def save_seen_ids(seen_ids, all_items_map):
-    """Salva solo ID di annunci recenti (entro MAX_AGE_HOURS). Autopulizia automatica."""
-    now    = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=MAX_AGE_HOURS)
-    ids_to_keep = set()
-    for item_id in seen_ids:
-        item = all_items_map.get(item_id)
-        if item:
-            dt = get_item_date(item)
-            if dt is None or dt >= cutoff:
-                ids_to_keep.add(item_id)
-        # Se l'annuncio non è più nel fetch, probabilmente rimosso: lo droppiamo
+def save_seen_ids(seen_ids, min_id_threshold):
+    """Salva solo ID >= soglia. Autopulizia automatica degli ID vecchi."""
+    ids_to_keep = {sid for sid in seen_ids if int(sid) >= min_id_threshold}
     with open(SEEN_IDS_FILE, "w") as f:
         json.dump(list(ids_to_keep)[-2000:], f)
-    log.info(f"seen_ids salvati: {len(ids_to_keep)} (rimossi {len(seen_ids) - len(ids_to_keep)} vecchi)")
+    log.info(f"seen_ids salvati: {len(ids_to_keep)} (rimossi {len(seen_ids)-len(ids_to_keep)} vecchi)")
 
 
-def is_recent(item):
-    """True se l'annuncio è stato pubblicato nelle ultime MAX_AGE_HOURS ore."""
-    dt = get_item_date(item)
-    if dt is None:
-        return True  # data sconosciuta: lascia passare
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_AGE_HOURS)
-    if dt < cutoff:
-        log.info(f"  [SKIP vecchio {dt.strftime('%d/%m %H:%M')}] {item.get('title')}")
+def is_fresh(item, min_id_threshold):
+    item_id = int(item.get("id", 0))
+    if item_id < min_id_threshold:
+        log.info(f"  [SKIP vecchio ID={item_id}] {item.get('title')}")
         return False
     return True
 
@@ -130,9 +109,10 @@ def fetch_items(scraper, query):
     try:
         r = scraper.get(f"{VINTED_BASE_URL}/api/v2/catalog/items",
                         params=params, headers=headers, timeout=20)
-        log.info(f"[{query}] HTTP {r.status_code}, ricevuti: {len(r.json().get('items', []))}")
         r.raise_for_status()
-        return r.json().get("items", [])
+        items = r.json().get("items", [])
+        log.info(f"[{query}] HTTP {r.status_code}, ricevuti: {len(items)}")
+        return items
     except Exception as e:
         log.error(f"[{query}] Fetch error: {e}")
         return []
@@ -151,11 +131,8 @@ def item_url(item):
 
 def send_summary(items):
     """
-    Invia UN UNICO messaggio Telegram con tutti gli annunci nuovi.
-    Formato per ogni annuncio:
-      🎮 Titolo — 💶 Prezzo  📅 Data  🔗 Link
-    Telegram supporta max 4096 caratteri per messaggio;
-    se supera il limite, manda messaggi aggiuntivi.
+    Invia UN UNICO messaggio Telegram riepilogativo.
+    Se supera 4000 caratteri, manda messaggi aggiuntivi consecutivi.
     """
     header = f"🎮 *{len(items)} nuov{'o' if len(items)==1 else 'i'} annunci PSP su Vinted!*\n\n"
     lines = []
@@ -163,17 +140,10 @@ def send_summary(items):
         amount, currency = get_price(item)
         title = item.get("title", "N/D")
         url   = item_url(item)
-        dt    = get_item_date(item)
-        data_str = dt.strftime("%d/%m %H:%M") if dt else "?"
-        lines.append(
-            f"🎮 [{title}]({url})\n"
-            f"💶 *{amount} {currency}*  📅 {data_str}\n"
-        )
+        lines.append(f"🎮 [{title}]({url})\n💶 *{amount} {currency}*\n")
 
-    # Raggruppa le righe in messaggi da max 4000 char
     MAX_LEN = 4000
-    chunks  = []
-    current = header
+    chunks, current = [], header
     for line in lines:
         if len(current) + len(line) + 1 > MAX_LEN:
             chunks.append(current)
@@ -213,7 +183,7 @@ def main():
                         "order": "newest_first"}, timeout=20)
 
     seen_ids = load_seen_ids()
-    log.info(f"ID già visti: {len(seen_ids)}")
+    log.info(f"ID gi\u00e0 visti: {len(seen_ids)}")
 
     all_items_map = {}
     for query in SEARCH_QUERIES:
@@ -224,10 +194,12 @@ def main():
 
     log.info(f"Articoli unici (pre-filtro): {len(all_items_map)}")
 
+    min_id = get_min_id_threshold(list(all_items_map.values()))
+
     new_items = [
         item for item_id, item in all_items_map.items()
         if item_id not in seen_ids
-        and is_recent(item)
+        and is_fresh(item, min_id)
         and is_relevant(item)
     ]
     log.info(f"Nuovi annunci pertinenti e recenti: {len(new_items)}")
@@ -235,12 +207,12 @@ def main():
     if new_items:
         for item in new_items:
             seen_ids.add(str(item.get("id")))
-        send_summary(new_items)  # unico messaggio riepilogativo
+        send_summary(new_items)
         log.info(f"Notifica inviata: {len(new_items)} annunci")
     else:
-        log.info("Nessun annuncio nuovo — nessuna notifica.")
+        log.info("Nessun annuncio nuovo \u2014 nessuna notifica.")
 
-    save_seen_ids(seen_ids, all_items_map)
+    save_seen_ids(seen_ids, min_id)
     log.info("=== Fine ciclo ===")
 
 
