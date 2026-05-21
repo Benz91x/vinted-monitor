@@ -3,14 +3,20 @@ from datetime import datetime, timezone
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-VINTED_BASE_URL  = "https://www.vinted.it"
 PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
 
-# Gli ID di Vinted sono sequenziali e crescenti: ~10 milioni/giorno.
-# Filtriamo annunci vecchi confrontando il loro ID con la soglia dinamica.
+# Domini Vinted da monitorare
+VINTED_DOMAINS = [
+    "https://www.vinted.it",
+    "https://www.vinted.es",
+    "https://www.vinted.fr",
+    "https://www.vinted.de",
+]
+
+# ~10M ID/giorno su tutti i domini combinati; usiamo soglia conservativa
 MAX_AGE_HOURS = 24
-ID_PER_HOUR   = 416_000  # ~10M ID/giorno / 24
+ID_PER_HOUR   = 416_000
 
 SEARCH_QUERIES = [
     "PSP",
@@ -19,18 +25,30 @@ SEARCH_QUERIES = [
     "psp 2000",
     "psp 3000",
     "psp go",
+    "consola psp",
+    "console psp",
 ]
 
 BLACKLIST_KEYWORDS = [
-    "ps4", "ps5", "ps3", "ps2", "playstation 4", "playstation 5",
-    "playstation 3", "playstation 2",
+    "ps4", "ps5", "ps3", "ps2",
+    "playstation 4", "playstation 5", "playstation 3", "playstation 2",
     "xbox", "nintendo", "switch", "wii",
-    "carta", "carte", "card", "cards", "pokemon", "pok\u00e9mon",
-    "yugioh", "yu-gi-oh", "magic the gathering", "mtg",
+    "carta", "carte", "card", "cards",
+    "pokemon", "pok\u00e9mon", "yugioh", "yu-gi-oh", "magic the gathering", "mtg",
     "amiibo", "funko",
     "cover", "custodia", "borsa", "zaino", "poster", "tazza",
     "felpa", "maglietta", "t-shirt",
     "umd film", "umd movie",
+    "president safety",  # marca di abbigliamento che si chiama PSP
+    "p.s.p",             # altra marca non gaming
+]
+
+# Termini che DEVONO essere nel titolo (almeno uno)
+PSP_TITLE_TERMS = [
+    "psp",
+    "playstation portable",
+    "playstation-portable",
+    "ps portable",
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -38,11 +56,6 @@ log = logging.getLogger(__name__)
 
 
 def get_min_id_threshold(items_sample):
-    """
-    Calcola dinamicamente la soglia minima di ID.
-    Prende l'ID massimo del fetch corrente (= annuncio piu' recente)
-    e sottrae ID_PER_HOUR * MAX_AGE_HOURS.
-    """
     if not items_sample:
         return 0
     max_id = max(int(item.get("id", 0)) for item in items_sample)
@@ -59,7 +72,6 @@ def load_seen_ids():
 
 
 def save_seen_ids(seen_ids, min_id_threshold):
-    """Salva solo ID >= soglia. Autopulizia automatica degli ID vecchi."""
     ids_to_keep = {sid for sid in seen_ids if int(sid) >= min_id_threshold}
     with open(SEEN_IDS_FILE, "w") as f:
         json.dump(list(ids_to_keep)[-2000:], f)
@@ -75,46 +87,53 @@ def is_fresh(item, min_id_threshold):
 
 
 def is_relevant(item):
-    title       = item.get("title", "").lower()
-    description = item.get("description", "").lower()
-    brand       = (item.get("brand_title") or "").lower()
-    text        = f"{title} {description} {brand}"
+    title = (item.get("title") or "").lower()
+    description = (item.get("description") or "").lower()
+    brand = (item.get("brand_title") or "").lower()
+    full_text = f"{title} {description} {brand}"
 
+    # 1. Deve contenere un termine PSP nel titolo
+    if not any(t in title for t in PSP_TITLE_TERMS):
+        log.info(f"  [SKIP no-psp-titolo] {item.get('title')}")
+        return False
+
+    # 2. Non deve contenere keyword nella blacklist
     for kw in BLACKLIST_KEYWORDS:
-        if kw in text:
+        if kw in full_text:
             log.info(f"  [SKIP blacklist='{kw}'] {item.get('title')}")
             return False
-
-    psp_terms = ["psp", "playstation portable"]
-    if not any(t in title for t in psp_terms):
-        log.info(f"  [SKIP no-psp-in-title] {item.get('title')}")
-        return False
 
     return True
 
 
-def fetch_items(scraper, query):
-    params = {
-        "search_text":  query,
-        "price_to":     PRICE_MAX,
-        "order":        "newest_first",
-        "per_page":     96,
-        "status_ids[]": 1,
-    }
-    headers = {
-        "Accept":           "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer":          f"{VINTED_BASE_URL}/catalog?search_text={query}",
-    }
+def fetch_items(scraper, base_url, query):
     try:
-        r = scraper.get(f"{VINTED_BASE_URL}/api/v2/catalog/items",
-                        params=params, headers=headers, timeout=20)
+        # Warm-up sul dominio specifico
+        r = scraper.get(
+            f"{base_url}/api/v2/catalog/items",
+            params={
+                "search_text":  query,
+                "price_to":     PRICE_MAX,
+                "order":        "newest_first",
+                "per_page":     96,
+                "status_ids[]": 1,
+            },
+            headers={
+                "Accept":           "application/json, text/plain, */*",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer":          f"{base_url}/catalog?search_text={query}",
+            },
+            timeout=20,
+        )
         r.raise_for_status()
         items = r.json().get("items", [])
-        log.info(f"[{query}] HTTP {r.status_code}, ricevuti: {len(items)}")
+        log.info(f"[{base_url}][{query}] HTTP {r.status_code}, ricevuti: {len(items)}")
+        # Aggiungi il dominio ad ogni item per costruire l'URL corretto
+        for item in items:
+            item["_domain"] = base_url
         return items
     except Exception as e:
-        log.error(f"[{query}] Fetch error: {e}")
+        log.error(f"[{base_url}][{query}] Fetch error: {e}")
         return []
 
 
@@ -126,14 +145,11 @@ def get_price(item):
 
 
 def item_url(item):
-    return f"{VINTED_BASE_URL}/items/{item.get('id', '')}"
+    domain = item.get("_domain", "https://www.vinted.it")
+    return item.get("url") or f"{domain}/items/{item.get('id', '')}"
 
 
 def send_summary(items):
-    """
-    Invia UN UNICO messaggio Telegram riepilogativo.
-    Se supera 4000 caratteri, manda messaggi aggiuntivi consecutivi.
-    """
     header = f"🎮 *{len(items)} nuov{'o' if len(items)==1 else 'i'} annunci PSP su Vinted!*\n\n"
     lines = []
     for item in items:
@@ -174,25 +190,27 @@ def main():
     scraper.headers.update({
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "it-IT,it;q=0.9",
+        "Accept-Language": "it-IT,it;q=0.9,es;q=0.8,fr;q=0.7,de;q=0.6",
     })
-
-    scraper.get(VINTED_BASE_URL, timeout=20)
-    scraper.get(f"{VINTED_BASE_URL}/catalog",
-                params={"search_text": SEARCH_QUERIES[0], "price_to": PRICE_MAX,
-                        "order": "newest_first"}, timeout=20)
 
     seen_ids = load_seen_ids()
     log.info(f"ID gi\u00e0 visti: {len(seen_ids)}")
 
     all_items_map = {}
-    for query in SEARCH_QUERIES:
-        for item in fetch_items(scraper, query):
-            item_id = str(item.get("id"))
-            if item_id not in all_items_map:
-                all_items_map[item_id] = item
+    for domain in VINTED_DOMAINS:
+        # Warm-up su ogni dominio
+        try:
+            scraper.get(domain, timeout=15)
+        except Exception as e:
+            log.warning(f"Warm-up fallito per {domain}: {e}")
 
-    log.info(f"Articoli unici (pre-filtro): {len(all_items_map)}")
+        for query in SEARCH_QUERIES:
+            for item in fetch_items(scraper, domain, query):
+                item_id = str(item.get("id"))
+                if item_id not in all_items_map:
+                    all_items_map[item_id] = item
+
+    log.info(f"Articoli unici totali (pre-filtro): {len(all_items_map)}")
 
     min_id = get_min_id_threshold(list(all_items_map.values()))
 
