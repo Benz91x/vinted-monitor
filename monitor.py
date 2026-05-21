@@ -4,7 +4,7 @@ import time
 import requests
 import cloudscraper
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ---------------------------------------------------------------------------
 # Config
@@ -16,6 +16,7 @@ STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
 RETRY_DELAY      = 4
 MAX_SEEN         = 1000
+MAX_AGE_DAYS     = 3   # scarta annunci piu' vecchi di 3 giorni
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -36,6 +37,7 @@ SEARCH_QUERIES = [
 BLACKLIST_KEYWORDS = [
     "ps4", "ps5", "ps3", "ps2",
     "playstation 4", "playstation 5", "playstation 3", "playstation 2",
+    "ps vita", "psvita", "vita",
     "xbox", "nintendo", "switch", "wii",
     "carta", "carte", "card", "cards",
     "pokemon", "yugioh", "yu-gi-oh",
@@ -62,10 +64,10 @@ def load_state():
             with open(STATE_FILE) as f:
                 data = json.load(f)
                 if isinstance(data.get("seen_ids"), list) and len(data["seen_ids"]) > 0:
-                    return data, False  # stato esistente
+                    return data, False
         except Exception:
             pass
-    return {"seen_ids": []}, True  # primo avvio
+    return {"seen_ids": []}, True
 
 
 def save_state(state):
@@ -73,6 +75,24 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
     log.info(f"State salvato: {len(state['seen_ids'])} seen_ids")
+
+
+# ---------------------------------------------------------------------------
+# Filtro data — usa photo.high_resolution.timestamp (affidabile su tutti i domini)
+# ---------------------------------------------------------------------------
+def is_recent(item):
+    try:
+        ts = item["photo"]["high_resolution"]["timestamp"]
+        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        age = datetime.now(timezone.utc) - dt
+        if age > timedelta(days=MAX_AGE_DAYS):
+            log.info(f"  [SKIP vecchio {age.days}gg] {item.get('title')}")
+            return False
+        return True
+    except Exception:
+        # Se manca il campo foto, accettiamo (meglio notificare che perdere)
+        log.warning(f"  [NO FOTO TIMESTAMP] {item.get('title')} - accettato")
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +219,6 @@ def main():
     seen_ids = set(state["seen_ids"])
     log.info(f"seen_ids caricati: {len(seen_ids)} | primo_avvio: {is_first_run}")
 
-    # Scarica e filtra solo PSP rilevanti
     all_psp = {}
     for domain in VINTED_DOMAINS:
         try:
@@ -213,24 +232,22 @@ def main():
                     iid = int(item["id"])
                 except (KeyError, ValueError):
                     continue
-                if iid not in all_psp and is_relevant(item):
+                if iid not in all_psp and is_relevant(item) and is_recent(item):
                     all_psp[iid] = item
             time.sleep(1)
 
-    log.info(f"Annunci PSP rilevanti trovati: {len(all_psp)}")
+    log.info(f"Annunci PSP recenti e rilevanti: {len(all_psp)}")
 
     if not all_psp:
-        log.warning("Nessun annuncio PSP trovato — API bloccata? State NON aggiornato.")
+        log.warning("Nessun annuncio PSP trovato. State NON aggiornato.")
         return
 
     if is_first_run:
-        # Salva baseline senza notificare nulla su Telegram
         state["seen_ids"] = list(all_psp.keys())
         save_state(state)
-        log.info(f"Baseline salvata: {len(all_psp)} annunci PSP. Nessuna notifica inviata.")
+        log.info(f"Baseline silenziosa: {len(all_psp)} annunci salvati.")
         return
 
-    # Run normale: notifica solo PSP non ancora visti
     new_items = [
         item for iid, item in all_psp.items()
         if iid not in seen_ids
