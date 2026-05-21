@@ -16,7 +16,7 @@ STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
 RETRY_DELAY      = 4
 MAX_SEEN         = 1000
-MAX_AGE_DAYS     = 3   # scarta annunci piu' vecchi di 3 giorni
+MAX_AGE_HOURS    = 6   # solo annunci delle ultime 6 ore
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -78,20 +78,20 @@ def save_state(state):
 
 
 # ---------------------------------------------------------------------------
-# Filtro data — usa photo.high_resolution.timestamp (affidabile su tutti i domini)
+# Filtro data — photo.high_resolution.timestamp e' affidabile su tutti i domini
 # ---------------------------------------------------------------------------
 def is_recent(item):
     try:
         ts = item["photo"]["high_resolution"]["timestamp"]
         dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
         age = datetime.now(timezone.utc) - dt
-        if age > timedelta(days=MAX_AGE_DAYS):
-            log.info(f"  [SKIP vecchio {age.days}gg] {item.get('title')}")
+        if age > timedelta(hours=MAX_AGE_HOURS):
+            log.info(f"  [SKIP vecchio {int(age.total_seconds()//3600)}h] {item.get('title')}")
             return False
+        log.info(f"  [OK {int(age.total_seconds()//60)}min fa] {item.get('title')}")
         return True
     except Exception:
-        # Se manca il campo foto, accettiamo (meglio notificare che perdere)
-        log.warning(f"  [NO FOTO TIMESTAMP] {item.get('title')} - accettato")
+        # nessun timestamp foto: accettiamo per non perdere annunci
         return True
 
 
@@ -184,9 +184,18 @@ def send_summary(items):
     lines = []
     for item in items:
         amount, currency = get_price(item)
-        title = item.get("title", "N/D")
-        url   = item_url(item)
-        lines.append(f"\U0001f3ae [{title}]({url})\n\U0001f4b6 *{amount} {currency}*\n")
+        title  = item.get("title", "N/D")
+        url    = item_url(item)
+        # mostra anche da quanti minuti e' stato pubblicato
+        try:
+            ts  = item["photo"]["high_resolution"]["timestamp"]
+            dt  = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            age = datetime.now(timezone.utc) - dt
+            mins = int(age.total_seconds() // 60)
+            age_str = f" \u23f0 {mins} min fa"
+        except Exception:
+            age_str = ""
+        lines.append(f"\U0001f3ae [{title}]({url})\n\U0001f4b6 *{amount} {currency}*{age_str}\n")
 
     MAX_LEN, chunks, current = 4000, [], header
     for line in lines:
