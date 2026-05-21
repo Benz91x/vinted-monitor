@@ -16,13 +16,17 @@ STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
 RETRY_DELAY      = 4
 MAX_SEEN         = 1000
-MAX_AGE_HOURS    = 6   # solo annunci delle ultime 6 ore
+MAX_AGE_HOURS    = 6
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
     "https://www.vinted.es",
     "https://www.vinted.fr",
     "https://www.vinted.de",
+    "https://www.vinted.pt",
+    "https://www.vinted.pl",
+    "https://www.vinted.be",
+    "https://www.vinted.nl",
 ]
 
 SEARCH_QUERIES = [
@@ -78,7 +82,7 @@ def save_state(state):
 
 
 # ---------------------------------------------------------------------------
-# Filtro data — photo.high_resolution.timestamp e' affidabile su tutti i domini
+# Filtro data
 # ---------------------------------------------------------------------------
 def is_recent(item):
     try:
@@ -91,7 +95,6 @@ def is_recent(item):
         log.info(f"  [OK {int(age.total_seconds()//60)}min fa] {item.get('title')}")
         return True
     except Exception:
-        # nessun timestamp foto: accettiamo per non perdere annunci
         return True
 
 
@@ -186,7 +189,7 @@ def send_summary(items):
         amount, currency = get_price(item)
         title  = item.get("title", "N/D")
         url    = item_url(item)
-        # mostra anche da quanti minuti e' stato pubblicato
+        domain = item.get("_domain", "").replace("https://www.", "")
         try:
             ts  = item["photo"]["high_resolution"]["timestamp"]
             dt  = datetime.fromtimestamp(int(ts), tz=timezone.utc)
@@ -195,7 +198,7 @@ def send_summary(items):
             age_str = f" \u23f0 {mins} min fa"
         except Exception:
             age_str = ""
-        lines.append(f"\U0001f3ae [{title}]({url})\n\U0001f4b6 *{amount} {currency}*{age_str}\n")
+        lines.append(f"\U0001f3ae [{title}]({url})\n\U0001f4b6 *{amount} {currency}*{age_str} \u2022 {domain}\n")
 
     MAX_LEN, chunks, current = 4000, [], header
     for line in lines:
@@ -221,7 +224,7 @@ def main():
     scraper.headers.update({
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "it-IT,it;q=0.9,es;q=0.8,fr;q=0.7,de;q=0.6",
+        "Accept-Language": "it-IT,it;q=0.9,es;q=0.8,fr;q=0.7,de;q=0.6,pt;q=0.5,nl;q=0.4,pl;q=0.3",
     })
 
     state, is_first_run = load_state()
