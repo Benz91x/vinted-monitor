@@ -4,9 +4,18 @@ from datetime import datetime
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 VINTED_BASE_URL  = "https://www.vinted.it"
-SEARCH_QUERY     = "PSP"
 PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
+
+# Query multiple: ogni stringa viene cercata separatamente su Vinted
+SEARCH_QUERIES = [
+    "PSP",
+    "PlayStation Portable",
+    "psp 1000",
+    "psp 2000",
+    "psp 3000",
+    "psp go",
+]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
@@ -24,9 +33,9 @@ def save_seen_ids(seen_ids):
         json.dump(list(seen_ids)[-1000:], f)
 
 
-def fetch_items(scraper):
+def fetch_items(scraper, query):
     params = {
-        "search_text":  SEARCH_QUERY,
+        "search_text":  query,
         "price_to":     PRICE_MAX,
         "order":        "newest_first",
         "per_page":     96,
@@ -35,18 +44,18 @@ def fetch_items(scraper):
     headers = {
         "Accept":              "application/json, text/plain, */*",
         "X-Requested-With":    "XMLHttpRequest",
-        "Referer":             f"{VINTED_BASE_URL}/catalog?search_text={SEARCH_QUERY}",
+        "Referer":             f"{VINTED_BASE_URL}/catalog?search_text={query}",
     }
     try:
         r = scraper.get(f"{VINTED_BASE_URL}/api/v2/catalog/items",
                         params=params, headers=headers, timeout=20)
-        log.info(f"Vinted API status: {r.status_code}")
+        log.info(f"[{query}] Vinted API status: {r.status_code}")
         r.raise_for_status()
         items = r.json().get("items", [])
-        log.info(f"Articoli ricevuti: {len(items)}")
+        log.info(f"[{query}] Articoli ricevuti: {len(items)}")
         return items
     except Exception as e:
-        log.error(f"Fetch error: {e}")
+        log.error(f"[{query}] Fetch error: {e}")
         return []
 
 
@@ -88,8 +97,8 @@ def build_summary(new_items):
     count = len(new_items)
     lines = [f"🎮 *{count} nuov{'o' if count == 1 else 'i'} annunci PSP su Vinted!*\n"]
 
-    shown   = new_items[:15]   # mostra max 15 per non sforare il limite Telegram
-    hidden  = count - len(shown)
+    shown  = new_items[:15]   # mostra max 15 per non sforare il limite Telegram
+    hidden = count - len(shown)
 
     for item in shown:
         amount, currency = get_price(item)
@@ -118,17 +127,28 @@ def main():
     log.info("Step 1: homepage...")
     scraper.get(VINTED_BASE_URL, timeout=20)
 
-    log.info("Step 2: catalogo...")
+    log.info("Step 2: catalogo warm-up...")
     scraper.get(f"{VINTED_BASE_URL}/catalog",
-                params={"search_text": SEARCH_QUERY,
+                params={"search_text": SEARCH_QUERIES[0],
                         "price_to": PRICE_MAX, "order": "newest_first"},
                 timeout=20)
 
     seen_ids  = load_seen_ids()
     log.info(f"ID già visti: {len(seen_ids)}")
 
-    items     = fetch_items(scraper)
-    new_items = [i for i in items if str(i.get("id")) not in seen_ids]
+    # Raccoglie articoli da tutte le query, deduplicando per ID
+    all_items_map = {}
+    for query in SEARCH_QUERIES:
+        items = fetch_items(scraper, query)
+        for item in items:
+            item_id = str(item.get("id"))
+            if item_id not in all_items_map:
+                all_items_map[item_id] = item
+
+    log.info(f"Articoli unici trovati in totale: {len(all_items_map)}")
+
+    new_items = [item for item_id, item in all_items_map.items()
+                 if item_id not in seen_ids]
     log.info(f"Nuovi annunci: {len(new_items)}")
 
     if new_items:
