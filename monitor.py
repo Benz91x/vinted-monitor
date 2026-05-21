@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 import cloudscraper
 import logging
@@ -11,7 +12,9 @@ from datetime import datetime
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 60
-STATE_FILE       = "state.json"   # salva solo max_id_seen
+STATE_FILE       = "state.json"
+RETRY_ATTEMPTS   = 3
+RETRY_DELAY      = 4   # secondi tra i retry
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -48,14 +51,18 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# State: salviamo SOLO il max ID visto per ogni dominio
-# Gli ID Vinted sono sequenziali: ID piu' alto = annuncio piu' recente.
-# Al prossimo run notifichiamo solo annunci con ID > max_id_seen.
+# State
 # ---------------------------------------------------------------------------
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+                # Considera valido solo se ha max_id
+                if data.get("max_id"):
+                    return data
+        except Exception:
+            pass
     return {}
 
 
@@ -86,35 +93,39 @@ def is_relevant(item):
 
 
 # ---------------------------------------------------------------------------
-# Fetch da API Vinted
+# Fetch con retry
 # ---------------------------------------------------------------------------
 def fetch_items(scraper, base_url, query):
-    try:
-        r = scraper.get(
-            f"{base_url}/api/v2/catalog/items",
-            params={
-                "search_text":   query,
-                "price_to":      PRICE_MAX,
-                "order":         "newest_first",
-                "per_page":      96,
-                "status_ids[]": 1,
-            },
-            headers={
-                "Accept":           "application/json, text/plain, */*",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer":          f"{base_url}/catalog?search_text={query}",
-            },
-            timeout=20,
-        )
-        r.raise_for_status()
-        items = r.json().get("items", [])
-        log.info(f"[{base_url}][{query}] {r.status_code} -> {len(items)} items")
-        for item in items:
-            item["_domain"] = base_url
-        return items
-    except Exception as e:
-        log.error(f"[{base_url}][{query}] Errore fetch: {e}")
-        return []
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            r = scraper.get(
+                f"{base_url}/api/v2/catalog/items",
+                params={
+                    "search_text":   query,
+                    "price_to":      PRICE_MAX,
+                    "order":         "newest_first",
+                    "per_page":      96,
+                    "status_ids[]": 1,
+                },
+                headers={
+                    "Accept":           "application/json, text/plain, */*",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer":          f"{base_url}/catalog?search_text={query}",
+                },
+                timeout=25,
+            )
+            r.raise_for_status()
+            items = r.json().get("items", [])
+            log.info(f"[{base_url}][{query}] tentativo {attempt} -> {len(items)} items")
+            for item in items:
+                item["_domain"] = base_url
+            return items
+        except Exception as e:
+            log.warning(f"[{base_url}][{query}] tentativo {attempt} fallito: {e}")
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_DELAY)
+    log.error(f"[{base_url}][{query}] tutti i tentativi falliti")
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -181,20 +192,19 @@ def main():
         "Accept-Language": "it-IT,it;q=0.9,es;q=0.8,fr;q=0.7,de;q=0.6",
     })
 
-    # Carica stato (max ID visto per dominio)
     state = load_state()
     is_first_run = not bool(state)
     if is_first_run:
-        log.info("*** PRIMO AVVIO: salvo baseline, nessuna notifica ***")
+        log.info("*** PRIMO AVVIO: salvo baseline ***")
     else:
         log.info(f"Stato caricato: {state}")
 
     # Scarica tutti gli annunci
-    # Struttura: { item_id_int: item_dict }
     all_items = {}
     for domain in VINTED_DOMAINS:
         try:
             scraper.get(domain, timeout=15)
+            time.sleep(1)
         except Exception as e:
             log.warning(f"Warm-up fallito per {domain}: {e}")
         for query in SEARCH_QUERIES:
@@ -205,18 +215,18 @@ def main():
                     continue
                 if iid not in all_items:
                     all_items[iid] = item
+            time.sleep(1)  # pausa tra query per non farsi bloccare
 
     log.info(f"Articoli unici totali: {len(all_items)}")
 
+    # IMPORTANTE: se 0 articoli, non aggiornare lo state (potrebbe essere un blocco temporaneo)
     if not all_items:
-        log.warning("Nessun articolo ricevuto dall'API, esco.")
+        log.warning("Nessun articolo ricevuto dall'API — state NON aggiornato, esco.")
         return
 
-    # Calcola max_id globale tra tutti i domini/query
     global_max_id = max(all_items.keys())
 
     if is_first_run:
-        # Salva il max_id attuale come baseline
         state["max_id"] = global_max_id
         save_state(state)
         log.info(f"Baseline: max_id={global_max_id}. Dal prossimo run partono le notifiche.")
@@ -227,7 +237,6 @@ def main():
         )
         return
 
-    # Run normale: notifica solo annunci con ID > max_id salvato E pertinenti
     last_max_id = int(state.get("max_id", 0))
     log.info(f"Cerco annunci con ID > {last_max_id}")
 
@@ -235,7 +244,6 @@ def main():
         item for iid, item in all_items.items()
         if iid > last_max_id and is_relevant(item)
     ]
-    # Ordina dal piu' recente (ID piu' alto) al meno recente
     new_items.sort(key=lambda x: int(x["id"]), reverse=True)
 
     log.info(f"Nuovi annunci PSP: {len(new_items)}")
@@ -246,7 +254,6 @@ def main():
     else:
         log.info("Nessun annuncio nuovo.")
 
-    # Aggiorna sempre il max_id
     state["max_id"] = global_max_id
     save_state(state)
     log.info("=== Fine ciclo ===")
