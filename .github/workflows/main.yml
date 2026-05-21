@@ -25,12 +25,11 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAX_ITEM_AGE_HOURS: "1"
         run: python monitor.py
 
-      - name: Salva seen_ids
+      - name: Salva state
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add seen_ids.json 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "Update seen_ids" && git push || true
+          git add state.json
+          git diff --staged --quiet || git commit -m "Update state [skip ci]" && git push || true
