@@ -7,7 +7,8 @@ PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
 MAX_SEEN_IDS     = 5000
 # Finestra massima di età per considerare un annuncio "recente" (in ore)
-MAX_ITEM_AGE_HOURS = int(os.environ.get("MAX_ITEM_AGE_HOURS", "24"))
+# Di default usiamo 1 ora, così anche senza variabile d'ambiente non arrivano annunci vecchi.
+MAX_ITEM_AGE_HOURS = float(os.environ.get("MAX_ITEM_AGE_HOURS", "1"))
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -127,8 +128,9 @@ def is_recent(item):
     """
     dt = parse_vinted_ts(item)
     if dt is None:
-        # Se non riusciamo a leggerlo, non rischiamo falsi negativi
-        return True
+        # Se non c'è data di creazione, NON lo consideriamo recente
+        log.info("  [SKIP no-created_at] %s", item.get("title"))
+        return False
 
     now = datetime.now(timezone.utc)
     age = now - dt
