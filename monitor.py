@@ -11,8 +11,7 @@ from datetime import datetime
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 60
-SEEN_IDS_FILE    = "seen_ids.json"
-MAX_SEEN_IDS     = 5000
+STATE_FILE       = "state.json"   # salva solo max_id_seen
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -35,45 +34,39 @@ BLACKLIST_KEYWORDS = [
     "playstation 4", "playstation 5", "playstation 3", "playstation 2",
     "xbox", "nintendo", "switch", "wii",
     "carta", "carte", "card", "cards",
-    "pokemon", "pokemon", "yugioh", "yu-gi-oh",
+    "pokemon", "yugioh", "yu-gi-oh",
     "amiibo", "funko",
     "cover", "custodia", "borsa", "zaino", "poster",
     "felpa", "maglietta", "t-shirt",
     "umd film", "umd movie",
 ]
 
-PSP_TERMS = [
-    "psp",
-    "playstation portable",
-    "ps portable",
-]
+PSP_TERMS = ["psp", "playstation portable", "ps portable"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# seen_ids helpers
+# State: salviamo SOLO il max ID visto per ogni dominio
+# Gli ID Vinted sono sequenziali: ID piu' alto = annuncio piu' recente.
+# Al prossimo run notifichiamo solo annunci con ID > max_id_seen.
 # ---------------------------------------------------------------------------
-def load_seen_ids():
-    if os.path.exists(SEEN_IDS_FILE):
-        with open(SEEN_IDS_FILE) as f:
-            data = json.load(f)
-        if data:
-            return set(str(i) for i in data), False
-    return set(), True
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {}
 
 
-def save_seen_ids(seen_ids):
-    # Mantieni solo gli ID più recenti (numericamente più alti)
-    ordered = sorted(seen_ids, key=lambda x: int(x), reverse=True)[:MAX_SEEN_IDS]
-    with open(SEEN_IDS_FILE, "w") as f:
-        json.dump(ordered, f)
-    log.info(f"seen_ids salvati: {len(ordered)}")
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+    log.info(f"State salvato: {state}")
 
 
 # ---------------------------------------------------------------------------
-# Filtro pertinenza
+# Filtro pertinenza PSP
 # ---------------------------------------------------------------------------
 def is_relevant(item):
     title       = (item.get("title") or "").lower()
@@ -93,7 +86,7 @@ def is_relevant(item):
 
 
 # ---------------------------------------------------------------------------
-# Fetch
+# Fetch da API Vinted
 # ---------------------------------------------------------------------------
 def fetch_items(scraper, base_url, query):
     try:
@@ -115,12 +108,12 @@ def fetch_items(scraper, base_url, query):
         )
         r.raise_for_status()
         items = r.json().get("items", [])
-        log.info(f"[{base_url}][{query}] HTTP {r.status_code}, ricevuti: {len(items)}")
+        log.info(f"[{base_url}][{query}] {r.status_code} -> {len(items)} items")
         for item in items:
             item["_domain"] = base_url
         return items
     except Exception as e:
-        log.error(f"[{base_url}][{query}] Fetch error: {e}")
+        log.error(f"[{base_url}][{query}] Errore fetch: {e}")
         return []
 
 
@@ -139,8 +132,21 @@ def item_url(item):
     return item.get("url") or f"{domain}/items/{item.get('id', '')}"
 
 
+def send_telegram(text):
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        data={
+            "chat_id":                  TELEGRAM_CHAT_ID,
+            "text":                     text,
+            "parse_mode":               "Markdown",
+            "disable_web_page_preview": True,
+        },
+        timeout=15,
+    )
+
+
 def send_summary(items):
-    header = f"\U0001f3ae *{len(items)} nuov{'o' if len(items)==1 else 'i'} annunci PSP su Vinted!*\n\n"
+    header = f"\U0001f3ae *{len(items)} nuov{'o' if len(items)==1 else 'i'} annunci PSP!*\n\n"
     lines = []
     for item in items:
         amount, currency = get_price(item)
@@ -148,8 +154,7 @@ def send_summary(items):
         url   = item_url(item)
         lines.append(f"\U0001f3ae [{title}]({url})\n\U0001f4b6 *{amount} {currency}*\n")
 
-    MAX_LEN = 4000
-    chunks, current = [], header
+    MAX_LEN, chunks, current = 4000, [], header
     for line in lines:
         if len(current) + len(line) + 1 > MAX_LEN:
             chunks.append(current)
@@ -158,18 +163,8 @@ def send_summary(items):
             current += line + "\n"
     if current.strip():
         chunks.append(current)
-
     for chunk in chunks:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                "chat_id":                  TELEGRAM_CHAT_ID,
-                "text":                     chunk,
-                "parse_mode":               "Markdown",
-                "disable_web_page_preview": True,
-            },
-            timeout=15,
-        )
+        send_telegram(chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -186,14 +181,17 @@ def main():
         "Accept-Language": "it-IT,it;q=0.9,es;q=0.8,fr;q=0.7,de;q=0.6",
     })
 
-    seen_ids, is_first_run = load_seen_ids()
+    # Carica stato (max ID visto per dominio)
+    state = load_state()
+    is_first_run = not bool(state)
     if is_first_run:
-        log.info("*** PRIMO AVVIO: popolo baseline seen_ids senza notificare ***")
+        log.info("*** PRIMO AVVIO: salvo baseline, nessuna notifica ***")
     else:
-        log.info(f"ID già visti: {len(seen_ids)}")
+        log.info(f"Stato caricato: {state}")
 
-    # Scarica tutti gli annunci dalle varie combinazioni dominio x query
-    all_items_map = {}
+    # Scarica tutti gli annunci
+    # Struttura: { item_id_int: item_dict }
+    all_items = {}
     for domain in VINTED_DOMAINS:
         try:
             scraper.get(domain, timeout=15)
@@ -201,55 +199,56 @@ def main():
             log.warning(f"Warm-up fallito per {domain}: {e}")
         for query in SEARCH_QUERIES:
             for item in fetch_items(scraper, domain, query):
-                item_id = str(item.get("id"))
-                if item_id not in all_items_map:
-                    all_items_map[item_id] = item
+                try:
+                    iid = int(item["id"])
+                except (KeyError, ValueError):
+                    continue
+                if iid not in all_items:
+                    all_items[iid] = item
 
-    log.info(f"Articoli unici totali: {len(all_items_map)}")
+    log.info(f"Articoli unici totali: {len(all_items)}")
+
+    if not all_items:
+        log.warning("Nessun articolo ricevuto dall'API, esco.")
+        return
+
+    # Calcola max_id globale tra tutti i domini/query
+    global_max_id = max(all_items.keys())
 
     if is_first_run:
-        # Primo avvio: segna tutto come visto, nessuna notifica
-        for item_id in all_items_map:
-            seen_ids.add(item_id)
-        save_seen_ids(seen_ids)
-        log.info(f"Baseline salvato: {len(seen_ids)} ID. Dal prossimo run partono le notifiche.")
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                "chat_id":    TELEGRAM_CHAT_ID,
-                "text":       f"\U0001f527 Monitor PSP avviato!\nBaseline di {len(seen_ids)} annunci salvato.\nDal prossimo run riceverai solo i nuovi annunci \U0001f680",
-                "parse_mode": "Markdown",
-            },
-            timeout=15,
+        # Salva il max_id attuale come baseline
+        state["max_id"] = global_max_id
+        save_state(state)
+        log.info(f"Baseline: max_id={global_max_id}. Dal prossimo run partono le notifiche.")
+        send_telegram(
+            f"\U0001f527 *Monitor PSP avviato!*\n"
+            f"Baseline ID: `{global_max_id}`\n"
+            f"Dal prossimo run riceverai solo i nuovi annunci \U0001f680"
         )
         return
 
-    # ---------------------------------------------------------------------------
-    # Run normale: notifica solo annunci mai visti E pertinenti
-    # NESSUN filtro per età: evitiamo di perdere annunci recenti per problemi di
-    # timezone o timestamp mancante dall'API Vinted.
-    # ---------------------------------------------------------------------------
-    new_items = [
-        item
-        for item_id, item in all_items_map.items()
-        if item_id not in seen_ids and is_relevant(item)
-    ]
+    # Run normale: notifica solo annunci con ID > max_id salvato E pertinenti
+    last_max_id = int(state.get("max_id", 0))
+    log.info(f"Cerco annunci con ID > {last_max_id}")
 
-    log.info(f"Nuovi annunci pertinenti: {len(new_items)}")
+    new_items = [
+        item for iid, item in all_items.items()
+        if iid > last_max_id and is_relevant(item)
+    ]
+    # Ordina dal piu' recente (ID piu' alto) al meno recente
+    new_items.sort(key=lambda x: int(x["id"]), reverse=True)
+
+    log.info(f"Nuovi annunci PSP: {len(new_items)}")
 
     if new_items:
-        for item in new_items:
-            seen_ids.add(str(item.get("id")))
         send_summary(new_items)
-        log.info(f"Notifica inviata: {len(new_items)} annunci")
+        log.info(f"Notifica inviata per {len(new_items)} annunci")
     else:
-        log.info("Nessun annuncio nuovo — nessuna notifica.")
+        log.info("Nessun annuncio nuovo.")
 
-    # Segna come visti anche gli annunci non pertinenti per non riprocessarli
-    for item_id in all_items_map:
-        seen_ids.add(item_id)
-
-    save_seen_ids(seen_ids)
+    # Aggiorna sempre il max_id
+    state["max_id"] = global_max_id
+    save_state(state)
     log.info("=== Fine ciclo ===")
 
 
