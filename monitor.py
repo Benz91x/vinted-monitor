@@ -6,7 +6,6 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 60
 SEEN_IDS_FILE    = "seen_ids.json"
 
-# Domini Vinted da monitorare
 VINTED_DOMAINS = [
     "https://www.vinted.it",
     "https://www.vinted.es",
@@ -14,7 +13,6 @@ VINTED_DOMAINS = [
     "https://www.vinted.de",
 ]
 
-# ~10M ID/giorno su tutti i domini combinati; usiamo soglia conservativa
 MAX_AGE_HOURS = 24
 ID_PER_HOUR   = 416_000
 
@@ -39,11 +37,10 @@ BLACKLIST_KEYWORDS = [
     "cover", "custodia", "borsa", "zaino", "poster", "tazza",
     "felpa", "maglietta", "t-shirt",
     "umd film", "umd movie",
-    "president safety",  # marca di abbigliamento che si chiama PSP
-    "p.s.p",             # altra marca non gaming
+    "president safety",
+    "p.s.p",
 ]
 
-# Termini che DEVONO essere nel titolo (almeno uno)
 PSP_TITLE_TERMS = [
     "psp",
     "playstation portable",
@@ -62,6 +59,34 @@ def get_min_id_threshold(items_sample):
     threshold = max_id - (ID_PER_HOUR * MAX_AGE_HOURS)
     log.info(f"ID max nel fetch: {max_id} | Soglia {MAX_AGE_HOURS}h: {threshold}")
     return threshold
+
+
+def estimate_upload_time(item, max_id_in_fetch):
+    """
+    Stima l'ora di caricamento basandosi sulla differenza di ID rispetto
+    all'annuncio piu' recente del fetch. Non e' precisa al minuto ma
+    da' un'indicazione affidabile (es. 'circa 2 ore fa').
+    """
+    item_id = int(item.get("id", 0))
+    id_diff = max_id_in_fetch - item_id
+    minutes_ago = id_diff / (ID_PER_HOUR / 60)  # ID_PER_HOUR / 60 = ID al minuto
+    now = datetime.now(timezone.utc)
+    from datetime import timedelta
+    estimated_dt = now - timedelta(minutes=minutes_ago)
+    return estimated_dt, int(minutes_ago)
+
+
+def format_upload_label(minutes_ago, estimated_dt):
+    """Restituisce una stringa leggibile tipo 'caricato ~5 min fa' o 'caricato ~2 ore fa'."""
+    if minutes_ago < 2:
+        return "caricato ~adesso"
+    elif minutes_ago < 60:
+        return f"caricato ~{int(minutes_ago)} min fa"
+    elif minutes_ago < 120:
+        return f"caricato ~1 ora fa"
+    else:
+        ore = int(minutes_ago / 60)
+        return f"caricato ~{ore} ore fa"
 
 
 def load_seen_ids():
@@ -92,12 +117,10 @@ def is_relevant(item):
     brand = (item.get("brand_title") or "").lower()
     full_text = f"{title} {description} {brand}"
 
-    # 1. Deve contenere un termine PSP nel titolo
     if not any(t in title for t in PSP_TITLE_TERMS):
         log.info(f"  [SKIP no-psp-titolo] {item.get('title')}")
         return False
 
-    # 2. Non deve contenere keyword nella blacklist
     for kw in BLACKLIST_KEYWORDS:
         if kw in full_text:
             log.info(f"  [SKIP blacklist='{kw}'] {item.get('title')}")
@@ -108,7 +131,6 @@ def is_relevant(item):
 
 def fetch_items(scraper, base_url, query):
     try:
-        # Warm-up sul dominio specifico
         r = scraper.get(
             f"{base_url}/api/v2/catalog/items",
             params={
@@ -128,7 +150,6 @@ def fetch_items(scraper, base_url, query):
         r.raise_for_status()
         items = r.json().get("items", [])
         log.info(f"[{base_url}][{query}] HTTP {r.status_code}, ricevuti: {len(items)}")
-        # Aggiungi il dominio ad ogni item per costruire l'URL corretto
         for item in items:
             item["_domain"] = base_url
         return items
@@ -149,14 +170,19 @@ def item_url(item):
     return item.get("url") or f"{domain}/items/{item.get('id', '')}"
 
 
-def send_summary(items):
+def send_summary(items, max_id_in_fetch):
     header = f"🎮 *{len(items)} nuov{'o' if len(items)==1 else 'i'} annunci PSP su Vinted!*\n\n"
     lines = []
     for item in items:
         amount, currency = get_price(item)
-        title = item.get("title", "N/D")
-        url   = item_url(item)
-        lines.append(f"🎮 [{title}]({url})\n💶 *{amount} {currency}*\n")
+        title  = item.get("title", "N/D")
+        url    = item_url(item)
+        _, minutes_ago = estimate_upload_time(item, max_id_in_fetch)
+        label  = format_upload_label(minutes_ago, None)
+        lines.append(
+            f"🎮 [{title}]({url})\n"
+            f"💶 *{amount} {currency}*  ⏰ _{label}_\n"
+        )
 
     MAX_LEN = 4000
     chunks, current = [], header
@@ -198,12 +224,10 @@ def main():
 
     all_items_map = {}
     for domain in VINTED_DOMAINS:
-        # Warm-up su ogni dominio
         try:
             scraper.get(domain, timeout=15)
         except Exception as e:
             log.warning(f"Warm-up fallito per {domain}: {e}")
-
         for query in SEARCH_QUERIES:
             for item in fetch_items(scraper, domain, query):
                 item_id = str(item.get("id"))
@@ -213,6 +237,7 @@ def main():
     log.info(f"Articoli unici totali (pre-filtro): {len(all_items_map)}")
 
     min_id = get_min_id_threshold(list(all_items_map.values()))
+    max_id = max((int(i.get("id", 0)) for i in all_items_map.values()), default=0)
 
     new_items = [
         item for item_id, item in all_items_map.items()
@@ -225,7 +250,7 @@ def main():
     if new_items:
         for item in new_items:
             seen_ids.add(str(item.get("id")))
-        send_summary(new_items)
+        send_summary(new_items, max_id)
         log.info(f"Notifica inviata: {len(new_items)} annunci")
     else:
         log.info("Nessun annuncio nuovo \u2014 nessuna notifica.")
