@@ -73,43 +73,32 @@ def save_seen_ids(seen_ids):
 
 
 def parse_vinted_ts(item):
-    """Porting semplificato dalla community: sceglie il timestamp migliore per la recenza.
+    """Per coerenza con l'etichetta "Caricato" usiamo SOLO la data di creazione.
 
-    Ordine di preferenza ispirato a vinted-parser:
-    created_at_ts, updated_at_ts, activation_ts, created_at, updated_at, active_at, last_push_up_at.
+    Alcuni campi (updated_at_ts, last_push_up_at, active_at) cambiano con i bump
+    e potrebbero far sembrare "recenti" annunci molto vecchi.
     """
-    candidates = [
-        "created_at_ts",
-        "updated_at_ts",
-        "activation_ts",
-        "created_at",
-        "updated_at",
-        "active_at",
-        "last_push_up_at",
-    ]
-    for key in candidates:
-        ts = item.get(key)
-        if not ts:
-            continue
-        try:
-            # Normalizza vari formati possibili
-            if isinstance(ts, (int, float)):
-                # alcune lib usano epoch (s o ms)
-                val = float(ts)
-                if val > 9_999_999_999:  # ms
-                    val /= 1000.0
-                dt = datetime.fromtimestamp(val, tz=timezone.utc)
+    ts = item.get("created_at_ts") or item.get("created_at")
+    if not ts:
+        return None
+    try:
+        # Gestisce sia ISO stringhe sia epoch numerici (secondi/ms)
+        if isinstance(ts, (int, float)):
+            val = float(ts)
+            if val > 9_999_999_999:  # ms
+                val /= 1000.0
+            dt = datetime.fromtimestamp(val, tz=timezone.utc)
+        else:
+            s = str(ts).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             else:
-                s = str(ts).replace("Z", "+00:00")
-                dt = datetime.fromisoformat(s)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                else:
-                    dt = dt.astimezone(timezone.utc)
-            return dt
-        except Exception:
-            continue
-    return None
+                dt = dt.astimezone(timezone.utc)
+        return dt
+    except Exception as e:
+        log.warning(f"  [WARN parse created_at_ts] {ts} ({e})")
+        return None
 
 
 def is_relevant(item):
@@ -131,24 +120,24 @@ def is_relevant(item):
 
 
 def is_recent(item):
-    """Ritorna True solo se l'annuncio è stato creato/attivato di recente.
+    """True solo se l'annuncio è stato CARICATO di recente.
 
-    Usa la stessa logica dei bot community (parse_vinted_ts) e poi confronta l'età con MAX_ITEM_AGE_HOURS.
+    Usiamo solo created_at_ts/created_at per evitare che i bump (push up) di annunci
+    vecchi li facciano sembrare nuovi.
     """
     dt = parse_vinted_ts(item)
     if dt is None:
-        # Se proprio non riusciamo a leggere un timestamp, non rischiamo falsi negativi
+        # Se non riusciamo a leggerlo, non rischiamo falsi negativi
         return True
 
     now = datetime.now(timezone.utc)
     age = now - dt
     if age.total_seconds() < 0:
-        # Data nel futuro? Consideriamolo recente
         return True
 
     if age > timedelta(hours=MAX_ITEM_AGE_HOURS):
         log.info(
-            "  [SKIP troppo vecchio] %s (age=%sd, ts=%s)",
+            "  [SKIP troppo vecchio] %s (age=%sd, created_at_ts=%s)",
             item.get("title"),
             round(age.total_seconds() / 86400, 2),
             dt.isoformat(),
@@ -285,7 +274,7 @@ def main():
         item for item_id, item in all_items_map.items()
         if item_id not in seen_ids and is_relevant(item) and is_recent(item)
     ]
-    # Ordiniamo usando il timestamp reale, non solo l'ID
+    # Ordiniamo usando il created_at reale, non solo l'ID
     new_items.sort(
         key=lambda x: parse_vinted_ts(x) or datetime.fromtimestamp(0, tz=timezone.utc),
         reverse=True,
