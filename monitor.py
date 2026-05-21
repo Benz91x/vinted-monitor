@@ -1,4 +1,4 @@
-import os, json, requests, cloudscraper, logging, re
+import os, json, requests, cloudscraper, logging
 from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
@@ -10,7 +10,6 @@ SEEN_IDS_FILE    = "seen_ids.json"
 # Scarta annunci pubblicati da più di MAX_AGE_DAYS giorni
 MAX_AGE_DAYS = 3
 
-# Query multiple: ogni stringa viene cercata separatamente su Vinted
 SEARCH_QUERIES = [
     "PSP",
     "PlayStation Portable",
@@ -20,12 +19,11 @@ SEARCH_QUERIES = [
     "psp go",
 ]
 
-# Parole chiave che fanno scartare l'annuncio (case-insensitive)
 BLACKLIST_KEYWORDS = [
     "ps4", "ps5", "ps3", "ps2", "playstation 4", "playstation 5",
     "playstation 3", "playstation 2",
     "xbox", "nintendo", "switch", "wii",
-    "carta", "carte", "card", "cards", "pokemon", "pok\u00e9mon",
+    "carta", "carte", "card", "cards", "pokemon", "pokémon",
     "yugioh", "yu-gi-oh", "magic the gathering", "mtg",
     "amiibo", "funko",
     "cover", "custodia", "borsa", "zaino", "poster", "tazza",
@@ -37,6 +35,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
 
+def get_item_date(item):
+    """Restituisce datetime UTC dell'annuncio oppure None."""
+    ts = item.get("created_at_ts") or item.get("updated_at_ts")
+    if ts:
+        try:
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        except Exception:
+            pass
+    iso = item.get("created_at") or item.get("updated_at")
+    if iso:
+        try:
+            return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    return None
+
+
 def load_seen_ids():
     if os.path.exists(SEEN_IDS_FILE):
         with open(SEEN_IDS_FILE) as f:
@@ -44,49 +59,45 @@ def load_seen_ids():
     return set()
 
 
-def save_seen_ids(seen_ids):
-    with open(SEEN_IDS_FILE, "w") as f:
-        json.dump(list(seen_ids)[-2000:], f)
-
-
-def is_recent(item):
+def save_seen_ids(seen_ids, all_items_map):
     """
-    Restituisce True se l'annuncio è stato pubblicato entro MAX_AGE_DAYS giorni.
-    Controlla i campi 'created_at_ts' (unix timestamp) o 'created_at' (ISO string).
+    Salva solo gli ID di annunci recenti (entro MAX_AGE_DAYS).
+    Gli ID di annunci più vecchi vengono rimossi automaticamente.
+    Questo evita che il file cresca all'infinito e che annunci
+    vecchi blocchino quelli nuovi.
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=MAX_AGE_DAYS)
 
-    # Prova prima il timestamp unix
-    ts = item.get("created_at_ts") or item.get("updated_at_ts")
-    if ts:
-        try:
-            created = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            if created < cutoff:
-                log.info(f"  [SKIP troppo vecchio: {created.date()}] {item.get('title')}")
-                return False
-            return True
-        except Exception:
-            pass
+    # Tieni solo gli ID che corrispondono ad annunci recenti
+    ids_to_keep = set()
+    for item_id in seen_ids:
+        item = all_items_map.get(item_id)
+        if item:
+            dt = get_item_date(item)
+            if dt and dt >= cutoff:
+                ids_to_keep.add(item_id)
+            elif not dt:
+                # data sconosciuta: teniamo per sicurezza
+                ids_to_keep.add(item_id)
+        # ID non presente nell'ultimo fetch = annuncio probabilmente rimosso, lo droppiamo
 
-    # Fallback: stringa ISO
-    iso = item.get("created_at") or item.get("updated_at")
-    if iso:
-        try:
-            created = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-            if created < cutoff:
-                log.info(f"  [SKIP troppo vecchio: {created.date()}] {item.get('title')}")
-                return False
-            return True
-        except Exception:
-            pass
+    with open(SEEN_IDS_FILE, "w") as f:
+        json.dump(list(ids_to_keep)[-2000:], f)
+    log.info(f"seen_ids salvati: {len(ids_to_keep)} (rimossi {len(seen_ids) - len(ids_to_keep)} vecchi)")
 
-    # Se non riesce a leggere la data, lascia passare l'annuncio
+
+def is_recent(item):
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=MAX_AGE_DAYS)
+    dt = get_item_date(item)
+    if dt and dt < cutoff:
+        log.info(f"  [SKIP troppo vecchio: {dt.date()}] {item.get('title')}")
+        return False
     return True
 
 
 def is_relevant(item):
-    """Restituisce True se l'annuncio è pertinente (console/accessori PSP)."""
     title       = item.get("title", "").lower()
     description = item.get("description", "").lower()
     brand       = (item.get("brand_title") or "").lower()
@@ -106,7 +117,6 @@ def is_relevant(item):
 
 
 def fetch_items(scraper, query):
-    """Recupera solo articoli disponibili (status_ids[]=1 = non venduti)."""
     params = {
         "search_text":  query,
         "price_to":     PRICE_MAX,
@@ -164,27 +174,14 @@ def send_photo_item(item):
     url    = item_url(item)
     photo  = get_photo_url(item)
 
-    # Data pubblicazione leggibile
-    ts = item.get("created_at_ts") or item.get("updated_at_ts")
-    iso = item.get("created_at") or item.get("updated_at")
-    data_str = ""
-    try:
-        if ts:
-            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-        elif iso:
-            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        else:
-            dt = None
-        if dt:
-            data_str = f"\n\ud83d\udcc5 Pubblicato: {dt.strftime('%d/%m/%Y %H:%M')}"
-    except Exception:
-        pass
+    dt = get_item_date(item)
+    data_str = f"\n📅 Pubblicato: {dt.strftime('%d/%m/%Y %H:%M')}" if dt else ""
 
     caption = (
-        f"\ud83c\udfae *{title}*\n"
-        f"\ud83d\udcb6 *{amount} {currency}*"
+        f"🎮 *{title}*\n"
+        f"💶 *{amount} {currency}*"
         f"{data_str}\n"
-        f"\ud83d\udd17 [Vedi su Vinted]({url})"
+        f"🔗 [Vedi su Vinted]({url})"
     )
 
     if photo:
@@ -215,7 +212,7 @@ def send_photo_item(item):
 
 
 def send_header(count):
-    text = f"\ud83c\udfae *{count} nuov{'o' if count == 1 else 'i'} annunci PSP su Vinted!*"
+    text = f"🎮 *{count} nuov{'o' if count == 1 else 'i'} annunci PSP su Vinted!*"
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
@@ -227,7 +224,7 @@ MAX_NOTIFICATIONS = 10
 
 
 def main():
-    log.info(f"=== Avvio \u2014 {datetime.now().strftime('%H:%M:%S')} ===")
+    log.info(f"=== Avvio — {datetime.now().strftime('%H:%M:%S')} ===")
 
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False})
@@ -247,7 +244,7 @@ def main():
                 timeout=20)
 
     seen_ids = load_seen_ids()
-    log.info(f"ID gi\u00e0 visti: {len(seen_ids)}")
+    log.info(f"ID già visti: {len(seen_ids)}")
 
     all_items_map = {}
     for query in SEARCH_QUERIES:
@@ -258,7 +255,6 @@ def main():
 
     log.info(f"Articoli unici (pre-filtro): {len(all_items_map)}")
 
-    # Filtra: recenti + pertinenti + non già visti
     new_items = [
         item for item_id, item in all_items_map.items()
         if item_id not in seen_ids
@@ -270,13 +266,11 @@ def main():
     if new_items:
         for item in new_items:
             seen_ids.add(str(item.get("id")))
-        save_seen_ids(seen_ids)
 
         to_notify = new_items[:MAX_NOTIFICATIONS]
         extra     = len(new_items) - len(to_notify)
 
         send_header(len(new_items))
-
         for item in to_notify:
             send_photo_item(item)
 
@@ -293,7 +287,10 @@ def main():
 
         log.info(f"Notifiche inviate: {len(to_notify)} (+ {extra} non mostrati)")
     else:
-        log.info("Nessun annuncio nuovo pertinente e recente \u2014 nessuna notifica.")
+        log.info("Nessun annuncio nuovo pertinente e recente — nessuna notifica.")
+
+    # Autopulizia: rimuove dal seen_ids gli ID di annunci più vecchi di MAX_AGE_DAYS
+    save_seen_ids(seen_ids, all_items_map)
 
     log.info("=== Fine ciclo ===")
 
