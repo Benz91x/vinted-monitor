@@ -14,7 +14,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 70
 STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
-RETRY_DELAY      = 4   # secondi tra i retry
+RETRY_DELAY      = 4
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -39,7 +39,7 @@ BLACKLIST_KEYWORDS = [
     "carta", "carte", "card", "cards",
     "pokemon", "yugioh", "yu-gi-oh",
     "amiibo", "funko",
-    "cover", "custodia", "borsa", "zaino", "poster",
+    "borsa", "zaino", "poster",
     "felpa", "maglietta", "t-shirt",
     "umd film", "umd movie",
 ]
@@ -51,24 +51,30 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# State
+# State — usa seen_ids: set di ID PSP gia' notificati
+# Salviamo gli ultimi 500 ID per non mandare duplicati
+# Il max_id NON serve piu': confrontiamo direttamente gli ID nel set
 # ---------------------------------------------------------------------------
+MAX_SEEN = 500
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
                 data = json.load(f)
-                if data.get("max_id"):
+                if isinstance(data.get("seen_ids"), list):
                     return data
         except Exception:
             pass
-    return {}
+    return {"seen_ids": [], "bootstrapped": False}
 
 
 def save_state(state):
+    # Mantieni solo gli ultimi MAX_SEEN id
+    state["seen_ids"] = state["seen_ids"][-MAX_SEEN:]
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
-    log.info(f"State salvato: {state}")
+    log.info(f"State salvato: {len(state['seen_ids'])} seen_ids, bootstrapped={state['bootstrapped']}")
 
 
 # ---------------------------------------------------------------------------
@@ -192,13 +198,13 @@ def main():
     })
 
     state = load_state()
-    is_first_run = not bool(state)
-    if is_first_run:
-        log.info("*** PRIMO AVVIO: salvo baseline ***")
-    else:
-        log.info(f"Stato caricato: {state}")
+    seen_ids = set(state["seen_ids"])
+    bootstrapped = state.get("bootstrapped", False)
 
-    all_items = {}
+    log.info(f"Stato: bootstrapped={bootstrapped}, seen_ids={len(seen_ids)}")
+
+    # Scarica tutti gli annunci PSP rilevanti
+    all_psp = {}  # id -> item
     for domain in VINTED_DOMAINS:
         try:
             scraper.get(domain, timeout=15)
@@ -211,39 +217,40 @@ def main():
                     iid = int(item["id"])
                 except (KeyError, ValueError):
                     continue
-                if iid not in all_items:
-                    all_items[iid] = item
+                # Deduplicazione cross-dominio/query
+                if iid not in all_psp and is_relevant(item):
+                    all_psp[iid] = item
             time.sleep(1)
 
-    log.info(f"Articoli unici totali: {len(all_items)}")
+    log.info(f"Annunci PSP rilevanti trovati: {len(all_psp)}")
 
-    if not all_items:
-        log.warning("Nessun articolo ricevuto dall'API — state NON aggiornato, esco.")
+    if not all_psp:
+        log.warning("Nessun annuncio PSP trovato — API bloccata o nessun risultato. State NON aggiornato.")
         return
 
-    global_max_id = max(all_items.keys())
-
-    if is_first_run:
-        state["max_id"] = global_max_id
+    if not bootstrapped:
+        # Primo avvio: salva tutti gli ID attuali come baseline, non notificare
+        new_seen = list(seen_ids | set(all_psp.keys()))
+        state["seen_ids"]    = new_seen
+        state["bootstrapped"] = True
         save_state(state)
-        log.info(f"Baseline: max_id={global_max_id}. Dal prossimo run partono le notifiche.")
+        log.info(f"Baseline: {len(all_psp)} annunci PSP salvati. Dal prossimo run partono le notifiche.")
         send_telegram(
             f"\U0001f527 *Monitor PSP avviato!*\n"
-            f"Baseline ID: `{global_max_id}`\n"
-            f"Dal prossimo run riceverai solo i nuovi annunci \U0001f680"
+            f"Trovati {len(all_psp)} annunci esistenti (non notificati).\n"
+            f"Dal prossimo run riceverai solo i nuovi \U0001f680"
         )
         return
 
-    last_max_id = int(state.get("max_id", 0))
-    log.info(f"Cerco annunci con ID > {last_max_id}")
-
+    # Run normale: notifica solo annunci NON ancora visti
     new_items = [
-        item for iid, item in all_items.items()
-        if iid > last_max_id and is_relevant(item)
+        item for iid, item in all_psp.items()
+        if iid not in seen_ids
     ]
+    # Ordina per ID decrescente (piu' recente prima)
     new_items.sort(key=lambda x: int(x["id"]), reverse=True)
 
-    log.info(f"Nuovi annunci PSP: {len(new_items)}")
+    log.info(f"Nuovi annunci PSP da notificare: {len(new_items)}")
 
     if new_items:
         send_summary(new_items)
@@ -251,7 +258,9 @@ def main():
     else:
         log.info("Nessun annuncio nuovo.")
 
-    state["max_id"] = global_max_id
+    # Aggiorna seen_ids con tutti gli ID PSP visti in questo run
+    state["seen_ids"]    = list(seen_ids | set(all_psp.keys()))
+    state["bootstrapped"] = True
     save_state(state)
     log.info("=== Fine ciclo ===")
 
