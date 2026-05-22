@@ -4,7 +4,7 @@ import time
 import requests
 import cloudscraper
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Config
@@ -14,9 +14,13 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 70
 STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
-RETRY_DELAY      = 4
+RETRY_DELAY      = 5
 MAX_SEEN         = 2000
 MAX_AGE_HOURS    = 24
+
+# Una sola query generica per dominio: Vinted ordina per newest_first
+# Filtrare lato nostro è molto più efficace che fare 12 query diverse
+SEARCH_QUERY = "PSP"
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -29,24 +33,8 @@ VINTED_DOMAINS = [
     "https://www.vinted.nl",
 ]
 
-SEARCH_QUERIES = [
-    "PSP",
-    "PSP 1000",
-    "PSP 2000",
-    "PSP 3000",
-    "PSP go",
-    "PSP slim",
-    "PSP fat",
-    "PlayStation Portable",
-    "sony psp",
-    "console portatile sony",
-    "consola portatil sony",
-    "console portable sony",
-]
-
 # ---------------------------------------------------------------------------
-# BLACKLIST CATEGORICA: scarta sempre questi tipi di prodotto
-# Solo accessori/componenti PURI, film, e console NON-PSP
+# BLACKLIST: scarta questi prodotti con certezza assoluta
 # ---------------------------------------------------------------------------
 BLACKLIST = [
     # Console NON-PSP
@@ -54,16 +42,14 @@ BLACKLIST = [
     "playstation 4", "playstation 5", "playstation 3", "playstation 2",
     "ps vita", "psvita",
     "xbox", "nintendo", "switch", "wii", "gameboy", "game boy",
-
     # Abbigliamento / oggettistica
     "felpa", "maglietta", "t-shirt", "vestito", "costume",
     "borsa", "zaino", "portafoglio",
     "poster", "quadro", "stampa",
     "amiibo", "funko", "action figure",
     "pokemon", "yugioh", "yu-gi-oh",
-
-    # Accessori PURI (senza console)
-    "batterie ", "batteria psp", "battery psp", "bateria psp", "akku psp",
+    # Accessori puri (senza console)
+    "batteria psp", "battery psp", "bateria psp", "akku psp",
     "batterie pour psp", "batterie psp",
     "chargeur psp", "caricatore psp", "charger psp", "cargador psp",
     "caricabatterie psp",
@@ -71,98 +57,51 @@ BLACKLIST = [
     "custodia psp", "housse psp", "funda psp", "case psp", "tasche psp",
     "skin psp", "sticker psp",
     "grip psp", "stand psp",
-
-    # Film UMD (formato UMD ma NON giochi)
+    # Film UMD
     "umd video", "umd film", "umd movie",
-
     # Servizi
     "modding service", "modding-service",
-    "stampa 3d", "3d print", "stampato",
-
-    # Giochi singoli CERTI (solo se il titolo inizia con uno di questi)
-    # NON messi qui — vengono gestiti sotto con logica separata
+    "stampa 3d", "3d print",
+    # Giochi singoli in lingua straniera (frasi chiare)
+    "jeu psp", "jogo psp", "juego psp", "spiel psp", "game psp", "gioco psp",
 ]
 
-# Giochi PSP noti: se il titolo E' SOLO il nome del gioco (senza "PSP" a inizio o "console")
-# Aggiungi qui solo giochi molto comuni che generano molti falsi positivi
+# Giochi PSP noti: scartati SOLO se nel titolo NON ci sono indizi di bundle/console
 KNOWN_GAMES = [
-    "god of war",
-    "gran turismo",
-    "need for speed",
-    "fifa ",
-    "pro evolution soccer", "pes ",
-    "assassin",
-    "grand theft auto", "gta",
-    "call of duty",
-    "metal gear",
-    "final fantasy",
-    "monster hunter",
-    "kingdom hearts",
-    "naruto",
-    "dragon ball",
-    "one piece",
-    "tekken",
-    "ridge racer",
-    "burnout",
-    "midnight club",
-    "socom",
-    "wipeout",
-    "lumines",
-    "lego ",
-    "star wars",
-    "harry potter",
-    "batman",
-    "spider-man", "spiderman",
+    "god of war", "gran turismo", "need for speed",
+    "fifa ", "pro evolution soccer", "pes ",
+    "assassin", "grand theft auto", "gta",
+    "call of duty", "metal gear", "final fantasy",
+    "monster hunter", "kingdom hearts",
+    "naruto", "dragon ball", "one piece",
+    "tekken", "ridge racer", "burnout",
+    "midnight club", "socom", "wipeout",
+    "lumines", "lego ", "star wars",
+    "harry potter", "batman", "spider-man", "spiderman",
     "sims ", "les sims",
     "world cup", "coupe du monde", "coppa del mondo",
     "pro cycling", "tour de france",
     "daxter", "ratchet", "jak ",
-    "crash ",
-    "tony hawk",
-    "guitar hero",
-    "singstar",
-    "buzz",
-    "katamari",
-    "locoroco",
-    "patapon",
-    "mystery dungeon",
-    "hot shots golf",
-    "ape escape",
-    "pursuit force",
-    "syphon filter",
-    "killzone",
-    "resistance",
-    "silent hill",
-    "coded arms",
-    "outrun",
-    "flatout",
-    "moto gp",
-    "dirt ",
-    "wrc ",
-    "v-rally",
-    "f1 ",
-    "nba ",
-    "nfl ",
-    "nhl ",
-    "rugby ",
-    "tennis ",
-    "golf ",
-    "boxing ",
-    "wrestling ",
-    "ufc ",
-    "smackdown",
-    "pro baseball",
-    "cricket",
-    "swimming",
-    "puzzle",
-    "mahjong",
-    "sudoku",
-    "jeu psp",  # francese: "jeu" = gioco
-    "jogo psp",  # portoghese
-    "juego psp",  # spagnolo
-    "spiel psp",  # tedesco
-    "game psp",
-    "gioco psp",
+    "crash ", "tony hawk", "guitar hero",
+    "singstar", "katamari", "locoroco", "patapon",
+    "hot shots golf", "ape escape",
+    "pursuit force", "syphon filter", "killzone",
+    "resistance", "silent hill", "coded arms",
+    "outrun", "flatout", "moto gp",
+    "dirt ", "wrc ", "v-rally",
+    "f1 ", "nba ", "nfl ", "nhl ",
+    "rugby ", "tennis ", "golf ", "boxing ",
+    "wrestling ", "ufc ", "smackdown",
+]
+
+# Se il titolo contiene almeno uno di questi -> è un bundle/console, non solo gioco
+BUNDLE_HINTS = [
+    "console", "consola", "consolle",
+    "portatile", "portable", "portatil",
+    "psp 1", "psp 2", "psp 3", "psp go", "psp slim", "psp fat",
+    "con giochi", "avec jeux", "con juegos", "with games", "com jogos",
+    "+ giochi", "+ jeux", "bundle", "lotto", "lot ", "lote",
+    "scheda", "memory", "completo", "completa", "komplett",
 ]
 
 PSP_TERMS = [
@@ -239,8 +178,7 @@ def is_recent(item):
 
 
 # ---------------------------------------------------------------------------
-# Filtro principale: BLACKLIST-FIRST
-# Accetta tutto ciò che riguarda PSP, scarta solo ciò che è certamente altro
+# Filtro principale
 # ---------------------------------------------------------------------------
 def is_interesting(item):
     title = (item.get("title") or "").lower().strip()
@@ -252,24 +190,14 @@ def is_interesting(item):
         log.info(f"  [SKIP no-psp] {item.get('title')}")
         return False
 
-    # 2. Blacklist categorica (console NON-PSP, abbigliamento, accessori puri certi)
+    # 2. Blacklist categorica
     for kw in BLACKLIST:
         if kw in full_text:
             log.info(f"  [SKIP blacklist='{kw}'] {item.get('title')}")
             return False
 
-    # 3. Se il titolo inizia con il nome di un gioco noto (e non contiene parole
-    #    che indicano bundle/console/lotto) -> scarta
-    BUNDLE_HINTS = [
-        "console", "consola", "consolle", "portatile", "portable", "portatil",
-        "psp 1", "psp 2", "psp 3", "psp go", "psp slim", "psp fat",
-        "con giochi", "avec jeux", "con juegos", "with games", "com jogos",
-        "+ giochi", "+ jeux", "bundle", "lotto", "lot ", "lote",
-        "scheda", "memory", "custodia",  # bundle con accessori ok
-        "completo", "completa", "komplett",
-    ]
+    # 3. Gioco noto senza bundle hint -> scarta
     has_bundle = any(h in full_text for h in BUNDLE_HINTS)
-
     if not has_bundle:
         for game in KNOWN_GAMES:
             if title.startswith(game) or f" {game}" in title:
@@ -281,39 +209,49 @@ def is_interesting(item):
 
 
 # ---------------------------------------------------------------------------
-# Fetch con retry
+# Fetch: UNA query per dominio, due pagine (96+96 = fino a 192 annunci freschi)
 # ---------------------------------------------------------------------------
-def fetch_items(scraper, base_url, query):
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            r = scraper.get(
-                f"{base_url}/api/v2/catalog/items",
-                params={
-                    "search_text":   query,
-                    "price_to":      PRICE_MAX,
-                    "order":         "newest_first",
-                    "per_page":      96,
-                    "status_ids[]": 1,
-                },
-                headers={
-                    "Accept":           "application/json, text/plain, */*",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer":          f"{base_url}/catalog?search_text={query}",
-                },
-                timeout=25,
-            )
-            r.raise_for_status()
-            items = r.json().get("items", [])
-            log.info(f"[{base_url}][{query}] -> {len(items)} items")
-            for item in items:
-                item["_domain"] = base_url
-            return items
-        except Exception as e:
-            log.warning(f"[{base_url}][{query}] tentativo {attempt} fallito: {e}")
-            if attempt < RETRY_ATTEMPTS:
-                time.sleep(RETRY_DELAY)
-    log.error(f"[{base_url}][{query}] tutti i tentativi falliti")
-    return []
+def fetch_items(scraper, base_url):
+    results = {}
+    for page in (1, 2):
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            try:
+                r = scraper.get(
+                    f"{base_url}/api/v2/catalog/items",
+                    params={
+                        "search_text":   SEARCH_QUERY,
+                        "price_to":      PRICE_MAX,
+                        "order":         "newest_first",
+                        "per_page":      96,
+                        "page":          page,
+                        "status_ids[]":  1,
+                    },
+                    headers={
+                        "Accept":           "application/json, text/plain, */*",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer":          f"{base_url}/catalog?search_text={SEARCH_QUERY}&order=newest_first",
+                    },
+                    timeout=25,
+                )
+                r.raise_for_status()
+                items = r.json().get("items", [])
+                log.info(f"[{base_url}] pagina {page} -> {len(items)} items")
+                for item in items:
+                    item["_domain"] = base_url
+                    try:
+                        results[int(item["id"])] = item
+                    except (KeyError, ValueError):
+                        pass
+                break  # pagina ok, esci dal retry loop
+            except Exception as e:
+                log.warning(f"[{base_url}] pagina {page} tentativo {attempt} fallito: {e}")
+                if attempt < RETRY_ATTEMPTS:
+                    time.sleep(RETRY_DELAY)
+        else:
+            log.error(f"[{base_url}] pagina {page} tutti i tentativi falliti")
+        time.sleep(2)  # pausa tra pagina 1 e pagina 2
+
+    return list(results.values())
 
 
 # ---------------------------------------------------------------------------
@@ -393,20 +331,22 @@ def main():
 
     all_psp = {}
     for domain in VINTED_DOMAINS:
+        # Warm-up cookie/session per il dominio
         try:
             scraper.get(domain, timeout=15)
-            time.sleep(1)
+            time.sleep(2)
         except Exception as e:
             log.warning(f"Warm-up fallito per {domain}: {e}")
-        for query in SEARCH_QUERIES:
-            for item in fetch_items(scraper, domain, query):
-                try:
-                    iid = int(item["id"])
-                except (KeyError, ValueError):
-                    continue
-                if iid not in all_psp and is_interesting(item) and is_recent(item):
-                    all_psp[iid] = item
-            time.sleep(1)
+
+        for item in fetch_items(scraper, domain):
+            try:
+                iid = int(item["id"])
+            except (KeyError, ValueError):
+                continue
+            if iid not in all_psp and is_interesting(item) and is_recent(item):
+                all_psp[iid] = item
+
+        time.sleep(3)  # pausa tra un dominio e il prossimo
 
     log.info(f"Annunci interessanti: {len(all_psp)}")
 
