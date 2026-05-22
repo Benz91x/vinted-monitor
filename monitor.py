@@ -15,8 +15,8 @@ PRICE_MAX        = 70
 STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
 RETRY_DELAY      = 4
-MAX_SEEN         = 1000
-MAX_AGE_HOURS    = 6
+MAX_SEEN         = 2000
+MAX_AGE_HOURS    = 24   # notifica solo annunci delle ultime 24 ore
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -82,20 +82,52 @@ def save_state(state):
 
 
 # ---------------------------------------------------------------------------
-# Filtro data
+# Timestamp annuncio — prova tutti i campi noti
 # ---------------------------------------------------------------------------
-def is_recent(item):
+def get_age_hours(item):
+    """Ritorna l'eta' dell'annuncio in ore, o None se non determinabile."""
+    # 1. photo.high_resolution.timestamp (piu' affidabile)
     try:
         ts = item["photo"]["high_resolution"]["timestamp"]
         dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-        age = datetime.now(timezone.utc) - dt
-        if age > timedelta(hours=MAX_AGE_HOURS):
-            log.info(f"  [SKIP vecchio {int(age.total_seconds()//3600)}h] {item.get('title')}")
-            return False
-        log.info(f"  [OK {int(age.total_seconds()//60)}min fa] {item.get('title')}")
-        return True
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
     except Exception:
+        pass
+
+    # 2. Campi numerici diretti
+    for field in ("created_at_ts", "updated_at_ts", "last_push_up_at"):
+        val = item.get(field)
+        if val:
+            try:
+                dt = datetime.fromtimestamp(int(val), tz=timezone.utc)
+                return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+            except Exception:
+                pass
+
+    # 3. Campi stringa ISO
+    for field in ("created_at", "updated_at"):
+        val = item.get(field)
+        if val and isinstance(val, str):
+            try:
+                dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+            except Exception:
+                pass
+
+    return None  # timestamp non trovato
+
+
+def is_recent(item):
+    age_h = get_age_hours(item)
+    if age_h is None:
+        # Nessun timestamp: accettiamo per non perdere annunci reali
+        log.warning(f"  [NO TIMESTAMP - accettato] {item.get('title')}")
         return True
+    if age_h > MAX_AGE_HOURS:
+        log.info(f"  [SKIP {int(age_h)}h fa] {item.get('title')}")
+        return False
+    log.info(f"  [OK {int(age_h*60)}min fa] {item.get('title')}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +174,7 @@ def fetch_items(scraper, base_url, query):
             )
             r.raise_for_status()
             items = r.json().get("items", [])
-            log.info(f"[{base_url}][{query}] tentativo {attempt} -> {len(items)} items")
+            log.info(f"[{base_url}][{query}] -> {len(items)} items")
             for item in items:
                 item["_domain"] = base_url
             return items
@@ -190,13 +222,11 @@ def send_summary(items):
         title  = item.get("title", "N/D")
         url    = item_url(item)
         domain = item.get("_domain", "").replace("https://www.", "")
-        try:
-            ts  = item["photo"]["high_resolution"]["timestamp"]
-            dt  = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            age = datetime.now(timezone.utc) - dt
-            mins = int(age.total_seconds() // 60)
-            age_str = f" \u23f0 {mins} min fa"
-        except Exception:
+        age_h  = get_age_hours(item)
+        if age_h is not None:
+            mins = int(age_h * 60)
+            age_str = f" \u23f0 {mins}min fa" if mins < 60 else f" \u23f0 {int(age_h)}h fa"
+        else:
             age_str = ""
         lines.append(f"\U0001f3ae [{title}]({url})\n\U0001f4b6 *{amount} {currency}*{age_str} \u2022 {domain}\n")
 
@@ -260,6 +290,7 @@ def main():
         log.info(f"Baseline silenziosa: {len(all_psp)} annunci salvati.")
         return
 
+    # Notifica solo annunci: recenti (gia' filtrati) E mai visti prima
     new_items = [
         item for iid, item in all_psp.items()
         if iid not in seen_ids
