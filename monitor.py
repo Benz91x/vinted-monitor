@@ -29,54 +29,84 @@ VINTED_DOMAINS = [
     "https://www.vinted.nl",
 ]
 
-# Query di ricerca: catturano una rete ampia, il filtro PSP_TERMS fa la selezione
 SEARCH_QUERIES = [
-    "PSP",
-    "PlayStation Portable",
-    "psp 1000",
-    "psp 2000",
-    "psp 3000",
-    "psp go",
-    "sony psp",
+    "PSP console",
+    "PSP 1000",
+    "PSP 2000",
+    "PSP 3000",
+    "PSP go",
+    "PlayStation Portable console",
+    "sony psp console",
     "console portatile sony",
     "consola portatil sony",
-    "console portable sony",
+    "console portable sony psp",
 ]
 
+# ---------------------------------------------------------------------------
+# Parole che indicano CONSOLE (almeno una deve essere presente)
+# ---------------------------------------------------------------------------
+CONSOLE_TERMS = [
+    "console",
+    "consola",
+    "consolle",
+    "handheld",
+    "portatile",
+    "portatil",
+    "portable",
+    "spielkonsole",
+    "konsole",
+    "psp 1000", "psp 2000", "psp 3000", "psp 4000",
+    "psp fat", "psp slim", "psp go",
+    "psp-1", "psp-2", "psp-3",
+    "psp-e100", "psp-n100",
+    "play station portable",
+    "playstation portable",
+    # annunci tipo "PSP + giochi" o "PSP con giochi" spesso sono bundle con console
+    "con giochi", "avec jeux", "con juegos", "with games", "met games",
+    "mit spielen", "com jogos",
+    "+ giochi", "+ jeux", "+ juegos",
+    "bundle", "lote", "lot ",
+    # venditore che scrive solo "PSP" intendendo la console (titolo molto corto)
+]
+
+# ---------------------------------------------------------------------------
+# Parole che indicano SOLO accessorio/gioco/film → scarta sempre
+# ---------------------------------------------------------------------------
+ACCESSORY_ONLY_TERMS = [
+    "batterie", "batteria", "battery", "bateria", "akku",
+    "chargeur", "caricatore", "caricabatterie", "charger", "cargador", "carregador", "ladegerät",
+    "custodia", "housse", "funda", "case ", "tasche", "hoes",
+    "memory stick", "memory card", "scheda memoria", "carte memoire",
+    "umd video", "umd film", "umd movie",
+    "film psp", "movie psp",
+    "crazy kung", "training day",   # film UMD specifici
+    "modding service", "modding-service",
+    "microsd", "micro sd",
+    "grip", "stand", "dock",
+    "skin ", "sticker", "decal",
+]
+
+# ---------------------------------------------------------------------------
+# Blacklist categorica
+# ---------------------------------------------------------------------------
 BLACKLIST_KEYWORDS = [
     "ps4", "ps5", "ps3", "ps2",
     "playstation 4", "playstation 5", "playstation 3", "playstation 2",
     "ps vita", "psvita", "vita",
     "xbox", "nintendo", "switch", "wii",
-    "carta", "carte", "card", "cards",
     "pokemon", "yugioh", "yu-gi-oh",
     "amiibo", "funko",
     "borsa", "zaino", "poster",
     "felpa", "maglietta", "t-shirt",
-    "umd film", "umd movie",
     "stampato", "stampa 3d", "3d print",
-    "supporto", "supporti",
 ]
 
-# Termini che identificano una PSP nell'annuncio
 PSP_TERMS = [
     "psp",
     "playstation portable",
-    "ps portable",
     "play station portable",
-    "playstation portatile",
-    "consola portatil",    # spagnolo/portoghese
-    "console portable sony",
+    "ps portable",
 ]
-
-# Termini che identificano la CATEGORIA console (per annunci vaghi tipo "Sony play station")
-# In questo caso ci basiamo sulla query di ricerca che li ha trovati
-CONSOLE_SEARCH_QUERIES = {
-    "console portatile sony",
-    "consola portatil sony",
-    "console portable sony",
-    "sony psp",
-}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
@@ -145,28 +175,42 @@ def is_recent(item):
 
 
 # ---------------------------------------------------------------------------
-# Filtro pertinenza PSP
+# Filtro: deve essere una CONSOLE PSP, non un accessorio/gioco
 # ---------------------------------------------------------------------------
-def is_relevant(item, query=""):
+def is_console(item):
     title       = (item.get("title") or "").lower()
     description = (item.get("description") or "").lower()
-    brand       = (item.get("brand_title") or "").lower()
-    full_text   = f"{title} {description} {brand}"
+    full_text   = f"{title} {description}"
 
-    # Blocca blacklist prima di tutto
+    # 1. Scarta subito se è palesemente solo un accessorio
+    for kw in ACCESSORY_ONLY_TERMS:
+        if kw in full_text:
+            log.info(f"  [SKIP accessorio='{kw}'] {item.get('title')}")
+            return False
+
+    # 2. Scarta blacklist
     for kw in BLACKLIST_KEYWORDS:
         if kw in full_text:
             log.info(f"  [SKIP blacklist='{kw}'] {item.get('title')}")
             return False
 
-    # Se trovato tramite query generica Sony, accettiamo direttamente
-    if query.lower() in CONSOLE_SEARCH_QUERIES:
+    # 3. Deve contenere almeno un termine PSP
+    if not any(t in full_text for t in PSP_TERMS):
+        log.info(f"  [SKIP no-psp-term] {item.get('title')}")
+        return False
+
+    # 4. Deve contenere almeno un termine che indica console/hardware
+    #    OPPURE il titolo è molto corto (tipo "PSP" o "PSP nera") → probabile console
+    title_words = len(title.split())
+    has_console_term = any(t in full_text for t in CONSOLE_TERMS)
+    is_short_title   = title_words <= 5  # titoli corti come "PSP", "PSP nera", "Sony PSP"
+
+    if has_console_term or is_short_title:
+        log.info(f"  [OK console] {item.get('title')}")
         return True
 
-    # Altrimenti deve contenere almeno un termine PSP
-    if any(t in full_text for t in PSP_TERMS):
-        return True
-
+    # 5. Titolo più lungo senza termine console → probabilmente solo un gioco
+    log.info(f"  [SKIP probabile-gioco] {item.get('title')}")
     return False
 
 
@@ -197,7 +241,6 @@ def fetch_items(scraper, base_url, query):
             log.info(f"[{base_url}][{query}] -> {len(items)} items")
             for item in items:
                 item["_domain"] = base_url
-                item["_query"]  = query
             return items
         except Exception as e:
             log.warning(f"[{base_url}][{query}] tentativo {attempt} fallito: {e}")
@@ -295,14 +338,14 @@ def main():
                     iid = int(item["id"])
                 except (KeyError, ValueError):
                     continue
-                if iid not in all_psp and is_relevant(item, query) and is_recent(item):
+                if iid not in all_psp and is_console(item) and is_recent(item):
                     all_psp[iid] = item
             time.sleep(1)
 
-    log.info(f"Annunci PSP recenti e rilevanti: {len(all_psp)}")
+    log.info(f"Console PSP recenti: {len(all_psp)}")
 
     if not all_psp:
-        log.warning("Nessun annuncio PSP trovato. State NON aggiornato.")
+        log.warning("Nessuna console PSP trovata. State NON aggiornato.")
         return
 
     if is_first_run:
