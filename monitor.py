@@ -30,75 +30,139 @@ VINTED_DOMAINS = [
 ]
 
 SEARCH_QUERIES = [
-    "PSP console",
+    "PSP",
     "PSP 1000",
     "PSP 2000",
     "PSP 3000",
     "PSP go",
-    "PlayStation Portable console",
-    "sony psp console",
+    "PSP slim",
+    "PSP fat",
+    "PlayStation Portable",
+    "sony psp",
     "console portatile sony",
     "consola portatil sony",
-    "console portable sony psp",
+    "console portable sony",
 ]
 
 # ---------------------------------------------------------------------------
-# Parole che indicano CONSOLE (almeno una deve essere presente)
+# BLACKLIST CATEGORICA: scarta sempre questi tipi di prodotto
+# Solo accessori/componenti PURI, film, e console NON-PSP
 # ---------------------------------------------------------------------------
-CONSOLE_TERMS = [
-    "console",
-    "consola",
-    "consolle",
-    "handheld",
-    "portatile",
-    "portatil",
-    "portable",
-    "spielkonsole",
-    "konsole",
-    "psp 1000", "psp 2000", "psp 3000", "psp 4000",
-    "psp fat", "psp slim", "psp go",
-    "psp-1", "psp-2", "psp-3",
-    "psp-e100", "psp-n100",
-    "play station portable",
-    "playstation portable",
-    # annunci tipo "PSP + giochi" o "PSP con giochi" spesso sono bundle con console
-    "con giochi", "avec jeux", "con juegos", "with games", "met games",
-    "mit spielen", "com jogos",
-    "+ giochi", "+ jeux", "+ juegos",
-    "bundle", "lote", "lot ",
-    # venditore che scrive solo "PSP" intendendo la console (titolo molto corto)
-]
-
-# ---------------------------------------------------------------------------
-# Parole che indicano SOLO accessorio/gioco/film → scarta sempre
-# ---------------------------------------------------------------------------
-ACCESSORY_ONLY_TERMS = [
-    "batterie", "batteria", "battery", "bateria", "akku",
-    "chargeur", "caricatore", "caricabatterie", "charger", "cargador", "carregador", "ladegerät",
-    "custodia", "housse", "funda", "case ", "tasche", "hoes",
-    "memory stick", "memory card", "scheda memoria", "carte memoire",
-    "umd video", "umd film", "umd movie",
-    "film psp", "movie psp",
-    "crazy kung", "training day",   # film UMD specifici
-    "modding service", "modding-service",
-    "microsd", "micro sd",
-    "grip", "stand", "dock",
-    "skin ", "sticker", "decal",
-]
-
-# ---------------------------------------------------------------------------
-# Blacklist categorica
-# ---------------------------------------------------------------------------
-BLACKLIST_KEYWORDS = [
+BLACKLIST = [
+    # Console NON-PSP
     "ps4", "ps5", "ps3", "ps2",
     "playstation 4", "playstation 5", "playstation 3", "playstation 2",
-    "ps vita", "psvita", "vita",
-    "xbox", "nintendo", "switch", "wii",
+    "ps vita", "psvita",
+    "xbox", "nintendo", "switch", "wii", "gameboy", "game boy",
+
+    # Abbigliamento / oggettistica
+    "felpa", "maglietta", "t-shirt", "vestito", "costume",
+    "borsa", "zaino", "portafoglio",
+    "poster", "quadro", "stampa",
+    "amiibo", "funko", "action figure",
     "pokemon", "yugioh", "yu-gi-oh",
-    "amiibo", "funko",
-    "borsa", "zaino", "poster",
-    "felpa", "maglietta", "t-shirt",
-    "stampato", "stampa 3d", "3d print",
+
+    # Accessori PURI (senza console)
+    "batterie ", "batteria psp", "battery psp", "bateria psp", "akku psp",
+    "batterie pour psp", "batterie psp",
+    "chargeur psp", "caricatore psp", "charger psp", "cargador psp",
+    "caricabatterie psp",
+    "memory stick", "memory card psp",
+    "custodia psp", "housse psp", "funda psp", "case psp", "tasche psp",
+    "skin psp", "sticker psp",
+    "grip psp", "stand psp",
+
+    # Film UMD (formato UMD ma NON giochi)
+    "umd video", "umd film", "umd movie",
+
+    # Servizi
+    "modding service", "modding-service",
+    "stampa 3d", "3d print", "stampato",
+
+    # Giochi singoli CERTI (solo se il titolo inizia con uno di questi)
+    # NON messi qui — vengono gestiti sotto con logica separata
+]
+
+# Giochi PSP noti: se il titolo E' SOLO il nome del gioco (senza "PSP" a inizio o "console")
+# Aggiungi qui solo giochi molto comuni che generano molti falsi positivi
+KNOWN_GAMES = [
+    "god of war",
+    "gran turismo",
+    "need for speed",
+    "fifa ",
+    "pro evolution soccer", "pes ",
+    "assassin",
+    "grand theft auto", "gta",
+    "call of duty",
+    "metal gear",
+    "final fantasy",
+    "monster hunter",
+    "kingdom hearts",
+    "naruto",
+    "dragon ball",
+    "one piece",
+    "tekken",
+    "ridge racer",
+    "burnout",
+    "midnight club",
+    "socom",
+    "wipeout",
+    "lumines",
+    "lego ",
+    "star wars",
+    "harry potter",
+    "batman",
+    "spider-man", "spiderman",
+    "sims ", "les sims",
+    "world cup", "coupe du monde", "coppa del mondo",
+    "pro cycling", "tour de france",
+    "daxter", "ratchet", "jak ",
+    "crash ",
+    "tony hawk",
+    "guitar hero",
+    "singstar",
+    "buzz",
+    "katamari",
+    "locoroco",
+    "patapon",
+    "mystery dungeon",
+    "hot shots golf",
+    "ape escape",
+    "pursuit force",
+    "syphon filter",
+    "killzone",
+    "resistance",
+    "silent hill",
+    "coded arms",
+    "outrun",
+    "flatout",
+    "moto gp",
+    "dirt ",
+    "wrc ",
+    "v-rally",
+    "f1 ",
+    "nba ",
+    "nfl ",
+    "nhl ",
+    "rugby ",
+    "tennis ",
+    "golf ",
+    "boxing ",
+    "wrestling ",
+    "ufc ",
+    "smackdown",
+    "pro baseball",
+    "cricket",
+    "swimming",
+    "puzzle",
+    "mahjong",
+    "sudoku",
+    "jeu psp",  # francese: "jeu" = gioco
+    "jogo psp",  # portoghese
+    "juego psp",  # spagnolo
+    "spiel psp",  # tedesco
+    "game psp",
+    "gioco psp",
 ]
 
 PSP_TERMS = [
@@ -175,43 +239,45 @@ def is_recent(item):
 
 
 # ---------------------------------------------------------------------------
-# Filtro: deve essere una CONSOLE PSP, non un accessorio/gioco
+# Filtro principale: BLACKLIST-FIRST
+# Accetta tutto ciò che riguarda PSP, scarta solo ciò che è certamente altro
 # ---------------------------------------------------------------------------
-def is_console(item):
-    title       = (item.get("title") or "").lower()
+def is_interesting(item):
+    title = (item.get("title") or "").lower().strip()
     description = (item.get("description") or "").lower()
-    full_text   = f"{title} {description}"
+    full_text = f"{title} {description}"
 
-    # 1. Scarta subito se è palesemente solo un accessorio
-    for kw in ACCESSORY_ONLY_TERMS:
-        if kw in full_text:
-            log.info(f"  [SKIP accessorio='{kw}'] {item.get('title')}")
-            return False
+    # 1. Deve contenere un termine PSP
+    if not any(t in full_text for t in PSP_TERMS):
+        log.info(f"  [SKIP no-psp] {item.get('title')}")
+        return False
 
-    # 2. Scarta blacklist
-    for kw in BLACKLIST_KEYWORDS:
+    # 2. Blacklist categorica (console NON-PSP, abbigliamento, accessori puri certi)
+    for kw in BLACKLIST:
         if kw in full_text:
             log.info(f"  [SKIP blacklist='{kw}'] {item.get('title')}")
             return False
 
-    # 3. Deve contenere almeno un termine PSP
-    if not any(t in full_text for t in PSP_TERMS):
-        log.info(f"  [SKIP no-psp-term] {item.get('title')}")
-        return False
+    # 3. Se il titolo inizia con il nome di un gioco noto (e non contiene parole
+    #    che indicano bundle/console/lotto) -> scarta
+    BUNDLE_HINTS = [
+        "console", "consola", "consolle", "portatile", "portable", "portatil",
+        "psp 1", "psp 2", "psp 3", "psp go", "psp slim", "psp fat",
+        "con giochi", "avec jeux", "con juegos", "with games", "com jogos",
+        "+ giochi", "+ jeux", "bundle", "lotto", "lot ", "lote",
+        "scheda", "memory", "custodia",  # bundle con accessori ok
+        "completo", "completa", "komplett",
+    ]
+    has_bundle = any(h in full_text for h in BUNDLE_HINTS)
 
-    # 4. Deve contenere almeno un termine che indica console/hardware
-    #    OPPURE il titolo è molto corto (tipo "PSP" o "PSP nera") → probabile console
-    title_words = len(title.split())
-    has_console_term = any(t in full_text for t in CONSOLE_TERMS)
-    is_short_title   = title_words <= 5  # titoli corti come "PSP", "PSP nera", "Sony PSP"
+    if not has_bundle:
+        for game in KNOWN_GAMES:
+            if title.startswith(game) or f" {game}" in title:
+                log.info(f"  [SKIP gioco='{game}'] {item.get('title')}")
+                return False
 
-    if has_console_term or is_short_title:
-        log.info(f"  [OK console] {item.get('title')}")
-        return True
-
-    # 5. Titolo più lungo senza termine console → probabilmente solo un gioco
-    log.info(f"  [SKIP probabile-gioco] {item.get('title')}")
-    return False
+    log.info(f"  [OK] {item.get('title')}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -338,14 +404,14 @@ def main():
                     iid = int(item["id"])
                 except (KeyError, ValueError):
                     continue
-                if iid not in all_psp and is_console(item) and is_recent(item):
+                if iid not in all_psp and is_interesting(item) and is_recent(item):
                     all_psp[iid] = item
             time.sleep(1)
 
-    log.info(f"Console PSP recenti: {len(all_psp)}")
+    log.info(f"Annunci interessanti: {len(all_psp)}")
 
     if not all_psp:
-        log.warning("Nessuna console PSP trovata. State NON aggiornato.")
+        log.warning("Nessun annuncio trovato. State NON aggiornato.")
         return
 
     if is_first_run:
