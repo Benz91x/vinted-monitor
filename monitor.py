@@ -1,8 +1,10 @@
 import os
+import re
 import json
 import time
-import requests
 import logging
+import cloudscraper
+import requests
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -17,7 +19,6 @@ MAX_AGE_HOURS    = 24
 
 SEARCH_QUERY = "PSP"
 
-# Domini supportati dalla libreria vinted-api-wrapper
 VINTED_DOMAINS = ["it", "es", "fr", "de", "pt", "pl", "be", "nl"]
 
 # ---------------------------------------------------------------------------
@@ -118,7 +119,6 @@ def save_state(state):
 # Timestamp
 # ---------------------------------------------------------------------------
 def get_age_hours(item_dict):
-    # item_dict e' il dict grezzo dalla libreria
     try:
         ts = item_dict["photo"]["high_resolution"]["timestamp"]
         dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
@@ -147,7 +147,7 @@ def get_age_hours(item_dict):
 def is_recent(item_dict):
     age_h = get_age_hours(item_dict)
     if age_h is None:
-        return True  # accetta se non c'e' timestamp
+        return True
     if age_h > MAX_AGE_HOURS:
         log.info(f"  [SKIP {int(age_h)}h fa] {item_dict.get('title')}")
         return False
@@ -182,65 +182,114 @@ def is_interesting(item_dict):
 
 
 # ---------------------------------------------------------------------------
-# Fetch usando vinted-api-wrapper (gestisce cookie session automaticamente)
+# VINTED SESSION - metodo Gertje823: homepage prima, poi API
+# ---------------------------------------------------------------------------
+def make_vinted_session(domain):
+    """
+    Crea una sessione cloudscraper autenticata per il dominio Vinted specificato.
+    STEP 1: GET homepage per ottenere il cookie _vinted_XX_session
+    STEP 2: Estrai CSRF token dall'HTML
+    STEP 3: Aggiungi X-CSRF-Token agli headers
+    Ref: github.com/Gertje823/Vinted-Scraper
+    """
+    s = cloudscraper.create_scraper(
+        browser={
+            "browser": "chrome",
+            "platform": "windows",
+            "desktop": True,
+        }
+    )
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+        "DNT": "1",
+        "Connection": "keep-alive",
+    })
+
+    base_url = f"https://www.vinted.{domain}"
+    try:
+        resp = s.get(base_url, timeout=20)
+        log.info(f"[{domain}] homepage status={resp.status_code}, cookies={list(s.cookies.keys())}")
+
+        # Cerca CSRF token nell'HTML
+        csrf_match = re.search(r'"CSRF_TOKEN":"([^"]+)"', resp.text)
+        if csrf_match:
+            s.headers["X-CSRF-Token"] = csrf_match.group(1)
+            log.info(f"[{domain}] CSRF token trovato")
+        else:
+            log.warning(f"[{domain}] CSRF token NON trovato nell'HTML")
+    except Exception as e:
+        log.error(f"[{domain}] errore homepage: {e}")
+
+    return s, base_url
+
+
+# ---------------------------------------------------------------------------
+# Fetch annunci
 # ---------------------------------------------------------------------------
 def fetch_domain(domain):
-    """Usa vinted-api-wrapper per ottenere gli annunci piu' recenti."""
-    try:
-        from vinted import Vinted
-        vinted = Vinted(domain=domain)
-        # Pagina 1: 96 item, newest_first
-        result1 = vinted.search(
-            query=SEARCH_QUERY,
-            per_page=96,
-            order="newest_first",
-            price_to=PRICE_MAX,
-        )
-        items = list(result1) if result1 else []
-        # Pagina 2
-        try:
-            result2 = vinted.search(
-                query=SEARCH_QUERY,
-                per_page=96,
-                page=2,
-                order="newest_first",
-                price_to=PRICE_MAX,
-            )
-            if result2:
-                items += list(result2)
-        except Exception as e2:
-            log.warning(f"[{domain}] pagina 2 fallita: {e2}")
+    """
+    Ottieni annunci da Vinted per un dominio specifico.
+    Usa la sessione autenticata con cookie per chiamare /api/v2/catalog/items.
+    """
+    s, base_url = make_vinted_session(domain)
+    items = []
 
-        log.info(f"[{domain}] trovati {len(items)} item totali")
-        return items
-    except Exception as e:
-        log.error(f"[{domain}] fetch fallito: {e}")
-        return []
+    for page in [1, 2]:
+        params = {
+            "search_text":  SEARCH_QUERY,
+            "order":        "newest_first",
+            "per_page":     "96",
+            "page":         str(page),
+            "price_to":     str(PRICE_MAX),
+        }
+        url = f"{base_url}/api/v2/catalog/items"
+        try:
+            resp = s.get(url, params=params, timeout=20)
+            log.info(f"[{domain}] p{page} status={resp.status_code}")
+
+            if resp.status_code == 401:
+                log.warning(f"[{domain}] 401 - sessione non valida, riprovo con nuova sessione")
+                s, base_url = make_vinted_session(domain)
+                resp = s.get(url, params=params, timeout=20)
+                log.info(f"[{domain}] p{page} retry status={resp.status_code}")
+
+            if resp.status_code != 200:
+                log.warning(f"[{domain}] p{page} risposta non 200: {resp.status_code}")
+                break
+
+            data = resp.json()
+            page_items = data.get("items", [])
+            log.info(f"[{domain}] p{page} items={len(page_items)}")
+            items.extend(page_items)
+
+            # Se non ci sono piu' pagine
+            pagination = data.get("pagination", {})
+            if pagination.get("total_pages", 1) <= page:
+                break
+
+        except Exception as e:
+            log.error(f"[{domain}] p{page} eccezione: {e}")
+            break
+
+        time.sleep(1.5)  # pausa tra pagine dello stesso dominio
+
+    log.info(f"[{domain}] totale items fetch: {len(items)}")
+    return items
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers prezzo/url
 # ---------------------------------------------------------------------------
-def item_to_dict(item, domain):
-    """Converte oggetto Item o dict in dict normalizzato."""
-    if isinstance(item, dict):
-        d = item
-    else:
-        # oggetto dataclass della libreria
-        try:
-            import dataclasses
-            d = dataclasses.asdict(item)
-        except Exception:
-            d = item.__dict__ if hasattr(item, "__dict__") else {}
-    d["_domain"] = domain
-    return d
-
-
 def get_price_str(d):
     price = d.get("price", {})
     if isinstance(price, dict):
         return f"{price.get('amount', 'N/D')} {price.get('currency_code', 'EUR')}"
-    # la libreria puo' restituire price come stringa o float
     currency = d.get("currency", "EUR")
     return f"{price} {currency}"
 
@@ -318,17 +367,17 @@ def main():
 
     for domain in VINTED_DOMAINS:
         raw_items = fetch_domain(domain)
-        for raw in raw_items:
-            d = item_to_dict(raw, domain)
+        for item in raw_items:
+            item["_domain"] = domain
             try:
-                iid = int(d.get("id", 0))
+                iid = int(item.get("id", 0))
             except (ValueError, TypeError):
                 continue
             if iid == 0:
                 continue
-            if iid not in all_psp and is_interesting(d) and is_recent(d):
-                all_psp[iid] = d
-        time.sleep(2)  # pausa cortese tra domini
+            if iid not in all_psp and is_interesting(item) and is_recent(item):
+                all_psp[iid] = item
+        time.sleep(2)  # pausa tra domini
 
     log.info(f"Annunci interessanti totali: {len(all_psp)}")
 

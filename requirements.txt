@@ -1,2 +1,2 @@
-vinted-api-wrapper==1.2.0
+cloudscraper==1.2.71
 requests==2.31.0
