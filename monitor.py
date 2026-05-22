@@ -16,7 +16,7 @@ STATE_FILE       = "state.json"
 RETRY_ATTEMPTS   = 3
 RETRY_DELAY      = 4
 MAX_SEEN         = 2000
-MAX_AGE_HOURS    = 24   # notifica solo annunci delle ultime 24 ore
+MAX_AGE_HOURS    = 24
 
 VINTED_DOMAINS = [
     "https://www.vinted.it",
@@ -29,6 +29,7 @@ VINTED_DOMAINS = [
     "https://www.vinted.nl",
 ]
 
+# Query di ricerca: catturano una rete ampia, il filtro PSP_TERMS fa la selezione
 SEARCH_QUERIES = [
     "PSP",
     "PlayStation Portable",
@@ -36,6 +37,10 @@ SEARCH_QUERIES = [
     "psp 2000",
     "psp 3000",
     "psp go",
+    "sony psp",
+    "console portatile sony",
+    "consola portatil sony",
+    "console portable sony",
 ]
 
 BLACKLIST_KEYWORDS = [
@@ -53,7 +58,25 @@ BLACKLIST_KEYWORDS = [
     "supporto", "supporti",
 ]
 
-PSP_TERMS = ["psp", "playstation portable", "ps portable"]
+# Termini che identificano una PSP nell'annuncio
+PSP_TERMS = [
+    "psp",
+    "playstation portable",
+    "ps portable",
+    "play station portable",
+    "playstation portatile",
+    "consola portatil",    # spagnolo/portoghese
+    "console portable sony",
+]
+
+# Termini che identificano la CATEGORIA console (per annunci vaghi tipo "Sony play station")
+# In questo caso ci basiamo sulla query di ricerca che li ha trovati
+CONSOLE_SEARCH_QUERIES = {
+    "console portatile sony",
+    "consola portatil sony",
+    "console portable sony",
+    "sony psp",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
@@ -82,19 +105,15 @@ def save_state(state):
 
 
 # ---------------------------------------------------------------------------
-# Timestamp annuncio — prova tutti i campi noti
+# Timestamp
 # ---------------------------------------------------------------------------
 def get_age_hours(item):
-    """Ritorna l'eta' dell'annuncio in ore, o None se non determinabile."""
-    # 1. photo.high_resolution.timestamp (piu' affidabile)
     try:
         ts = item["photo"]["high_resolution"]["timestamp"]
         dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
         return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
     except Exception:
         pass
-
-    # 2. Campi numerici diretti
     for field in ("created_at_ts", "updated_at_ts", "last_push_up_at"):
         val = item.get(field)
         if val:
@@ -103,8 +122,6 @@ def get_age_hours(item):
                 return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
             except Exception:
                 pass
-
-    # 3. Campi stringa ISO
     for field in ("created_at", "updated_at"):
         val = item.get(field)
         if val and isinstance(val, str):
@@ -113,41 +130,44 @@ def get_age_hours(item):
                 return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
             except Exception:
                 pass
-
-    return None  # timestamp non trovato
+    return None
 
 
 def is_recent(item):
     age_h = get_age_hours(item)
     if age_h is None:
-        # Nessun timestamp: accettiamo per non perdere annunci reali
         log.warning(f"  [NO TIMESTAMP - accettato] {item.get('title')}")
         return True
     if age_h > MAX_AGE_HOURS:
         log.info(f"  [SKIP {int(age_h)}h fa] {item.get('title')}")
         return False
-    log.info(f"  [OK {int(age_h*60)}min fa] {item.get('title')}")
     return True
 
 
 # ---------------------------------------------------------------------------
 # Filtro pertinenza PSP
 # ---------------------------------------------------------------------------
-def is_relevant(item):
+def is_relevant(item, query=""):
     title       = (item.get("title") or "").lower()
     description = (item.get("description") or "").lower()
     brand       = (item.get("brand_title") or "").lower()
     full_text   = f"{title} {description} {brand}"
 
-    if not any(t in full_text for t in PSP_TERMS):
-        return False
-
+    # Blocca blacklist prima di tutto
     for kw in BLACKLIST_KEYWORDS:
         if kw in full_text:
             log.info(f"  [SKIP blacklist='{kw}'] {item.get('title')}")
             return False
 
-    return True
+    # Se trovato tramite query generica Sony, accettiamo direttamente
+    if query.lower() in CONSOLE_SEARCH_QUERIES:
+        return True
+
+    # Altrimenti deve contenere almeno un termine PSP
+    if any(t in full_text for t in PSP_TERMS):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +197,7 @@ def fetch_items(scraper, base_url, query):
             log.info(f"[{base_url}][{query}] -> {len(items)} items")
             for item in items:
                 item["_domain"] = base_url
+                item["_query"]  = query
             return items
         except Exception as e:
             log.warning(f"[{base_url}][{query}] tentativo {attempt} fallito: {e}")
@@ -274,7 +295,7 @@ def main():
                     iid = int(item["id"])
                 except (KeyError, ValueError):
                     continue
-                if iid not in all_psp and is_relevant(item) and is_recent(item):
+                if iid not in all_psp and is_relevant(item, query) and is_recent(item):
                     all_psp[iid] = item
             time.sleep(1)
 
@@ -290,7 +311,6 @@ def main():
         log.info(f"Baseline silenziosa: {len(all_psp)} annunci salvati.")
         return
 
-    # Notifica solo annunci: recenti (gia' filtrati) E mai visti prima
     new_items = [
         item for iid, item in all_psp.items()
         if iid not in seen_ids
