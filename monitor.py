@@ -14,7 +14,7 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PRICE_MAX        = 70
 STATE_FILE       = "state.json"
-MAX_SEEN         = 2000
+MAX_SEEN         = 3000
 MAX_AGE_HOURS    = 24
 
 SEARCH_QUERY = "PSP"
@@ -94,25 +94,42 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# State
+# State — gli ID sono SEMPRE stringhe, sia in memoria che su disco
+# Questo elimina qualsiasi ambiguita' int vs str nel confronto
 # ---------------------------------------------------------------------------
-def load_state():
+def load_seen_ids() -> set:
+    """Carica seen_ids come set di STRINGHE dal file JSON."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
                 data = json.load(f)
-                if isinstance(data.get("seen_ids"), list) and len(data["seen_ids"]) > 0:
-                    return data, False
-        except Exception:
-            pass
-    return {"seen_ids": []}, True
+            ids = data.get("seen_ids", [])
+            if isinstance(ids, list) and len(ids) > 0:
+                # Forza tutto a stringa per sicurezza
+                result = set(str(x) for x in ids)
+                log.info(f"State caricato: {len(result)} seen_ids")
+                return result
+        except Exception as e:
+            log.error(f"Errore caricamento state: {e}")
+    log.info("State non trovato o vuoto — primo avvio")
+    return set()
 
 
-def save_state(state):
-    state["seen_ids"] = state["seen_ids"][-MAX_SEEN:]
+def save_seen_ids(seen_ids: set):
+    """Salva seen_ids come lista di stringhe. Mantieni solo gli ultimi MAX_SEEN."""
+    ids_list = list(seen_ids)
+    if len(ids_list) > MAX_SEEN:
+        # Tieni i MAX_SEEN ID numericamente piu' grandi (i piu' recenti)
+        ids_list = sorted(ids_list, key=lambda x: int(x) if x.isdigit() else 0)
+        ids_list = ids_list[-MAX_SEEN:]
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-    log.info(f"State salvato: {len(state['seen_ids'])} seen_ids")
+        json.dump({"seen_ids": ids_list}, f)
+    log.info(f"State salvato: {len(ids_list)} seen_ids")
+
+
+def get_item_id(item: dict) -> str:
+    """Restituisce l'ID dell'annuncio SEMPRE come stringa."""
+    return str(item.get("id", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -182,22 +199,11 @@ def is_interesting(item_dict):
 
 
 # ---------------------------------------------------------------------------
-# VINTED SESSION - metodo Gertje823: homepage prima, poi API
+# Vinted session
 # ---------------------------------------------------------------------------
 def make_vinted_session(domain):
-    """
-    Crea una sessione cloudscraper autenticata per il dominio Vinted specificato.
-    STEP 1: GET homepage per ottenere il cookie _vinted_XX_session
-    STEP 2: Estrai CSRF token dall'HTML
-    STEP 3: Aggiungi X-CSRF-Token agli headers
-    Ref: github.com/Gertje823/Vinted-Scraper
-    """
     s = cloudscraper.create_scraper(
-        browser={
-            "browser": "chrome",
-            "platform": "windows",
-            "desktop": True,
-        }
+        browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
     s.headers.update({
         "User-Agent": (
@@ -210,22 +216,15 @@ def make_vinted_session(domain):
         "DNT": "1",
         "Connection": "keep-alive",
     })
-
     base_url = f"https://www.vinted.{domain}"
     try:
         resp = s.get(base_url, timeout=20)
-        log.info(f"[{domain}] homepage status={resp.status_code}, cookies={list(s.cookies.keys())}")
-
-        # Cerca CSRF token nell'HTML
+        log.info(f"[{domain}] homepage status={resp.status_code}")
         csrf_match = re.search(r'"CSRF_TOKEN":"([^"]+)"', resp.text)
         if csrf_match:
             s.headers["X-CSRF-Token"] = csrf_match.group(1)
-            log.info(f"[{domain}] CSRF token trovato")
-        else:
-            log.warning(f"[{domain}] CSRF token NON trovato nell'HTML")
     except Exception as e:
         log.error(f"[{domain}] errore homepage: {e}")
-
     return s, base_url
 
 
@@ -233,73 +232,55 @@ def make_vinted_session(domain):
 # Fetch annunci
 # ---------------------------------------------------------------------------
 def fetch_domain(domain):
-    """
-    Ottieni annunci da Vinted per un dominio specifico.
-    Usa la sessione autenticata con cookie per chiamare /api/v2/catalog/items.
-    """
     s, base_url = make_vinted_session(domain)
     items = []
-
     for page in [1, 2]:
         params = {
-            "search_text":  SEARCH_QUERY,
-            "order":        "newest_first",
-            "per_page":     "96",
-            "page":         str(page),
-            "price_to":     str(PRICE_MAX),
+            "search_text": SEARCH_QUERY,
+            "order":       "newest_first",
+            "per_page":    "96",
+            "page":        str(page),
+            "price_to":    str(PRICE_MAX),
         }
         url = f"{base_url}/api/v2/catalog/items"
         try:
             resp = s.get(url, params=params, timeout=20)
             log.info(f"[{domain}] p{page} status={resp.status_code}")
-
             if resp.status_code == 401:
-                log.warning(f"[{domain}] 401 - sessione non valida, riprovo con nuova sessione")
                 s, base_url = make_vinted_session(domain)
                 resp = s.get(url, params=params, timeout=20)
-                log.info(f"[{domain}] p{page} retry status={resp.status_code}")
-
             if resp.status_code != 200:
-                log.warning(f"[{domain}] p{page} risposta non 200: {resp.status_code}")
                 break
-
             data = resp.json()
             page_items = data.get("items", [])
             log.info(f"[{domain}] p{page} items={len(page_items)}")
             items.extend(page_items)
-
-            # Se non ci sono piu' pagine
             pagination = data.get("pagination", {})
             if pagination.get("total_pages", 1) <= page:
                 break
-
         except Exception as e:
             log.error(f"[{domain}] p{page} eccezione: {e}")
             break
-
-        time.sleep(1.5)  # pausa tra pagine dello stesso dominio
-
-    log.info(f"[{domain}] totale items fetch: {len(items)}")
+        time.sleep(1.5)
+    log.info(f"[{domain}] totale fetch: {len(items)}")
     return items
 
 
 # ---------------------------------------------------------------------------
-# Helpers prezzo/url
+# Helpers
 # ---------------------------------------------------------------------------
 def get_price_str(d):
     price = d.get("price", {})
     if isinstance(price, dict):
         return f"{price.get('amount', 'N/D')} {price.get('currency_code', 'EUR')}"
-    currency = d.get("currency", "EUR")
-    return f"{price} {currency}"
+    return f"{price} {d.get('currency', 'EUR')}"
 
 
 def item_url(d):
-    domain = d.get("_domain", "it")
     url = d.get("url")
     if url:
         return url
-    return f"https://www.vinted.{domain}/items/{d.get('id', '')}"
+    return f"https://www.vinted.{d.get('_domain', 'it')}/items/{d.get('id', '')}"
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +320,6 @@ def send_summary(items):
             f"\U0001f3ae [{title}]({url})\n"
             f"\U0001f4b6 *{price_str}*{age_str} \u2022 vinted.{domain}\n"
         )
-
     MAX_LEN, chunks, current = 4000, [], header
     for line in lines:
         if len(current) + len(line) + 1 > MAX_LEN:
@@ -359,25 +339,23 @@ def send_summary(items):
 def main():
     log.info(f"=== Avvio {datetime.now().strftime('%H:%M:%S')} ===")
 
-    state, is_first_run = load_state()
-    seen_ids = set(state["seen_ids"])
+    # Carica seen_ids come set di STRINGHE
+    seen_ids = load_seen_ids()
+    is_first_run = len(seen_ids) == 0
     log.info(f"seen_ids: {len(seen_ids)} | primo_avvio: {is_first_run}")
 
-    all_psp = {}  # id -> dict
-
+    # Raccogli tutti gli annunci interessanti
+    all_psp = {}  # str(id) -> dict
     for domain in VINTED_DOMAINS:
         raw_items = fetch_domain(domain)
         for item in raw_items:
             item["_domain"] = domain
-            try:
-                iid = int(item.get("id", 0))
-            except (ValueError, TypeError):
-                continue
-            if iid == 0:
+            iid = get_item_id(item)  # sempre stringa
+            if not iid or iid == "0":
                 continue
             if iid not in all_psp and is_interesting(item) and is_recent(item):
                 all_psp[iid] = item
-        time.sleep(2)  # pausa tra domini
+        time.sleep(2)
 
     log.info(f"Annunci interessanti totali: {len(all_psp)}")
 
@@ -386,18 +364,29 @@ def main():
         return
 
     if is_first_run:
-        state["seen_ids"] = list(all_psp.keys())
-        save_state(state)
+        # Prima esecuzione: salva baseline senza notificare
+        save_seen_ids(set(all_psp.keys()))
         log.info(f"Baseline silenziosa: {len(all_psp)} annunci salvati.")
         return
 
+    # Trova gli annunci NON ancora visti
+    # Confronto stringa vs stringa — nessuna ambiguita' di tipo
     new_items = [
         d for iid, d in all_psp.items()
         if iid not in seen_ids
     ]
-    new_items.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
+    new_items.sort(key=lambda x: int(get_item_id(x)) if get_item_id(x).isdigit() else 0, reverse=True)
 
     log.info(f"Nuovi da notificare: {len(new_items)}")
+    log.info(f"IDs nuovi: {[get_item_id(d) for d in new_items[:10]]}")
+    log.info(f"IDs seen (sample): {list(seen_ids)[:10]}")
+
+    # Aggiorna seen_ids con TUTTI gli annunci visti in questo run
+    # (sia quelli gia' noti che quelli nuovi)
+    seen_ids.update(all_psp.keys())
+
+    # Salva PRIMA di notificare: anche se Telegram fallisce, non rispediremo
+    save_seen_ids(seen_ids)
 
     if new_items:
         send_summary(new_items)
@@ -405,8 +394,6 @@ def main():
     else:
         log.info("Nessun annuncio nuovo.")
 
-    state["seen_ids"] = list(seen_ids | set(all_psp.keys()))
-    save_state(state)
     log.info("=== Fine ciclo ===")
 
 
