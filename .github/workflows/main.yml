@@ -1,9 +1,9 @@
 name: Vinted PSP Monitor
 
-on:
-  schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
+# on:
+#  schedule:
+#    - cron: '*/5 * * * *'
+#  workflow_dispatch:
 
 concurrency:
   group: vinted-monitor
